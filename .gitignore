@@ -1,0 +1,38 @@
+# Generated files and local state
+.DS_Store
+.build/
+build/
+.hvigor/
+.cxx/
+.swiftpm/
+node_modules/
+oh_modules/
+.ohpm/
+.idea/
+.preview/
+*.xcuserstate
+xcuserdata/
+local.properties
+.runtime/
+.integration/
+output/
+# Credentials and signing material
+.env
+.env.*
+*.local.json5
+*.p12
+*.p7b
+*.pem
+*.key
+*.jks
+*.keystore
+*.cer
+*.csr
+signing/
+*.log
+# Distributed artifacts belong in GitHub Releases
+*.hap
+*.hsp
+*.app/
+*.dmg
+*.zip
