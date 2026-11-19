@@ -13,6 +13,12 @@ final class ClipboardPermit {
     }
 }
 
+/// 只在主线程读取/消费；系统计数也覆盖“用户再次复制相同文字”，不靠内容去重猜测。
+final class ClipboardResumeGuard {
+    fileprivate var changeCount: Int?
+    fileprivate var consumed = false
+}
+
 /// 所有 NSPasteboard 接触都在主线程；后台仅指应用后台，锁屏/用户切换会停用。
 final class PlatformClipboard {
     private let boardName: String?
@@ -24,9 +30,17 @@ final class PlatformClipboard {
     private var ownCounts = Set<Int>()
     private var observers: [NSObjectProtocol] = []
     private var observerEpoch = UUID()
+    private var runtimeRefreshGeneration: UInt64 = 0
+    private let sessionState: () -> Bool
     var onRuntime: ((Bool) -> Void)?
     var onCapture: ((UUID, Int, ClipboardCapture) -> Void)?
-    init(name: String?) { boardName = name }
+    init(name: String?, sessionState: (() -> Bool)? = nil) {
+        boardName = name
+        self.sessionState = sessionState ?? {
+            let info = CGSessionCopyCurrentDictionary() as? [String: Any]
+            return info?["CGSSessionScreenIsLocked"] as? Bool != true && info?[kCGSessionOnConsoleKey as String] as? Bool == true
+        }
+    }
     static func validTestName(_ name: String) -> Bool {
         // 只接收命名板标识，不允许系统板别名或不可见字符。
         let system = ["general", "find", "drag", "font", "ruler", "nsgeneralpboard", "nsfindpboard", "nsdragpboard", "nsfontpboard", "nsrulerpboard", "com.apple.pasteboard.general", "com.apple.pasteboard.find", "com.apple.pasteboard.drag"]
@@ -39,6 +53,7 @@ final class PlatformClipboard {
             for token in tokens {
                 NSWorkspace.shared.notificationCenter.removeObserver(token)
                 DistributedNotificationCenter.default().removeObserver(token)
+                NotificationCenter.default.removeObserver(token)
             }
         }
     }
@@ -46,17 +61,32 @@ final class PlatformClipboard {
         DispatchQueue.main.async { [weak self] in
             guard let self else { return }
             let workspace = NSWorkspace.shared.notificationCenter
-            self.observers.append(workspace.addObserver(forName: NSWorkspace.sessionDidResignActiveNotification, object: nil, queue: .main) { [weak self] _ in self?.setActive(false) })
+            self.observers.append(workspace.addObserver(forName: NSWorkspace.sessionDidResignActiveNotification, object: nil, queue: .main) { [weak self] _ in self?.pauseRuntime() })
             self.observers.append(workspace.addObserver(forName: NSWorkspace.sessionDidBecomeActiveNotification, object: nil, queue: .main) { [weak self] _ in self?.refreshRuntime() })
             let distributed = DistributedNotificationCenter.default()
-            self.observers.append(distributed.addObserver(forName: .init("com.apple.screenIsLocked"), object: nil, queue: .main) { [weak self] _ in self?.setActive(false) })
+            self.observers.append(distributed.addObserver(forName: .init("com.apple.screenIsLocked"), object: nil, queue: .main) { [weak self] _ in self?.pauseRuntime() })
             self.observers.append(distributed.addObserver(forName: .init("com.apple.screenIsUnlocked"), object: nil, queue: .main) { [weak self] _ in self?.refreshRuntime() })
+            self.observers.append(NotificationCenter.default.addObserver(forName: NSApplication.didBecomeActiveNotification, object: nil, queue: .main) { [weak self] _ in self?.refreshRuntime() })
             self.refreshRuntime()
         }
     }
     private func refreshRuntime() {
-        let info = CGSessionCopyCurrentDictionary() as? [String: Any]
-        setActive(info?["CGSSessionScreenIsLocked"] as? Bool != true && info?[kCGSessionOnConsoleKey as String] as? Bool == true)
+        runtimeRefreshGeneration &+= 1
+        let generation = runtimeRefreshGeneration
+        setActive(sessionState())
+        // 解锁通知可能早于CGSession更新；每个恢复事件最多补查一次，不创建空闲轮询。
+        guard !active else { return }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.25) { [weak self] in
+            guard let self, self.runtimeRefreshGeneration == generation else { return }
+            self.setActive(self.sessionState())
+        }
+    }
+    private func pauseRuntime() {
+        runtimeRefreshGeneration &+= 1
+        setActive(false)
+    }
+    func requestRuntimeRefresh() {
+        DispatchQueue.main.async { [weak self] in self?.refreshRuntime() }
     }
     private func setActive(_ value: Bool) {
         if active == value { onRuntime?(value); return }
@@ -115,10 +145,20 @@ final class PlatformClipboard {
             completion(permit.perform { self.board.changeCount })
         }
     }
-    func write(_ text: String, permit: ClipboardPermit, markOwn: Bool = true, completion: @escaping (Bool?) -> Void) {
+    func makeResumeGuard() -> ClipboardResumeGuard {
+        let guardValue = ClipboardResumeGuard()
+        DispatchQueue.main.async { [weak self] in
+            guard let self else { return }; guardValue.changeCount = self.board.changeCount
+        }
+        return guardValue
+    }
+    func write(_ text: String, permit: ClipboardPermit, markOwn: Bool = true, resumeGuard: ClipboardResumeGuard? = nil, completion: @escaping (Bool?) -> Void) {
         DispatchQueue.main.async { [weak self] in
             guard let self, self.active else { completion(false); return }
+            // 校验紧挨实际写入，不能先在编排队列检查后再异步覆盖用户的新复制。
+            if let resumeGuard, resumeGuard.consumed || resumeGuard.changeCount != self.board.changeCount { completion(nil); return }
             let result = permit.perform {
+                resumeGuard?.consumed = true
                 self.board.clearContents()
                 let ok = self.board.setString(text, forType: .string)
                 if ok && markOwn {

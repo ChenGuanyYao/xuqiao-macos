@@ -8,7 +8,8 @@ let package = Package(
     targets: [
         .systemLibrary(name: "CSQLite", pkgConfig: "sqlite3"),
         .target(name: "XuQiaoCore", dependencies: ["CSQLite"]),
-        .executableTarget(name: "XuQiaoMac", dependencies: ["XuQiaoCore"])
+        .executableTarget(name: "XuQiaoMac", dependencies: ["XuQiaoCore"]),
+        .testTarget(name: "XuQiaoCoreTests", dependencies: ["XuQiaoCore"])
     ],
     swiftLanguageModes: [.v5]
 )
