@@ -16,8 +16,12 @@ final class ClipboardRecordStore {
         CREATE TABLE IF NOT EXISTS clipboard_snapshots(recordId TEXT PRIMARY KEY NOT NULL,relativePath TEXT NOT NULL,createdAt INTEGER NOT NULL,expiresAt INTEGER NOT NULL,byteSize INTEGER NOT NULL,state TEXT NOT NULL DEFAULT 'ready');
         CREATE TABLE IF NOT EXISTS clipboard_previews(sourceDeviceId TEXT NOT NULL,recordId TEXT NOT NULL,payloadSha256 TEXT NOT NULL,previewSha256 TEXT NOT NULL,mimeType TEXT NOT NULL,width INTEGER NOT NULL,height INTEGER NOT NULL,byteSize INTEGER NOT NULL,relativePath TEXT NOT NULL,lastAccessedAt INTEGER NOT NULL,PRIMARY KEY(sourceDeviceId,recordId,payloadSha256));
         CREATE INDEX IF NOT EXISTS idx_clipboard_previews_access ON clipboard_previews(lastAccessedAt);
-        CREATE TABLE IF NOT EXISTS clipboard_deliveries(recordId TEXT NOT NULL,peerId TEXT NOT NULL,trustGeneration TEXT NOT NULL,announcedVersion INTEGER NOT NULL DEFAULT -1,liveEpoch TEXT NOT NULL DEFAULT '',manual INTEGER NOT NULL DEFAULT 0,PRIMARY KEY(recordId,peerId,trustGeneration));
+        CREATE TABLE IF NOT EXISTS clipboard_deliveries(recordId TEXT NOT NULL,peerId TEXT NOT NULL,trustGeneration TEXT NOT NULL,announcedVersion INTEGER NOT NULL DEFAULT -1,liveEpoch TEXT NOT NULL DEFAULT '',manual INTEGER NOT NULL DEFAULT 0,attempted INTEGER NOT NULL DEFAULT 0,PRIMARY KEY(recordId,peerId,trustGeneration));
         """)
+        // 旧授权没有尝试记录，保守视为可能已送达；不清理历史或重置既有ACK。
+        if !(try rows("PRAGMA table_info(clipboard_deliveries)")).contains(where: { $0[1] == "attempted" }) {
+            try exec("ALTER TABLE clipboard_deliveries ADD COLUMN attempted INTEGER NOT NULL DEFAULT 1")
+        }
     }
     deinit { sqlite3_close(db) }
     func exec(_ sql: String) throws {
@@ -112,12 +116,14 @@ final class ClipboardRecordStore {
     func saveSnapshot(_ value: ClipboardSnapshotIndex) throws {
         try run("INSERT INTO clipboard_snapshots(recordId,relativePath,createdAt,expiresAt,byteSize,state) VALUES(?,?,?,?,?,?) ON CONFLICT(recordId) DO UPDATE SET state=excluded.state", [value.recordId,value.relativePath,value.createdAt,value.expiresAt,value.byteSize,value.state])
     }
-    func grants() throws -> [ClipboardGrant] {
-        try rows("SELECT recordId,peerId,trustGeneration,announcedVersion,liveEpoch,manual FROM clipboard_deliveries").map { ClipboardGrant(recordId: $0[0], peerId: $0[1], trustGeneration: $0[2], announcedVersion: Int64($0[3]) ?? -1, liveEpoch: $0[4], manual: $0[5] == "1") }
+    func grants(recordID: String? = nil, attemptedOnly: Bool = false) throws -> [ClipboardGrant] {
+        let conditions = [recordID == nil ? nil : "recordId=?", attemptedOnly ? "attempted=1" : nil].compactMap { $0 }
+        let clause = conditions.isEmpty ? "" : " WHERE " + conditions.joined(separator: " AND ")
+        return try rows("SELECT recordId,peerId,trustGeneration,announcedVersion,liveEpoch,manual FROM clipboard_deliveries" + clause, recordID.map { [$0] } ?? []).map { ClipboardGrant(recordId: $0[0], peerId: $0[1], trustGeneration: $0[2], announcedVersion: Int64($0[3]) ?? -1, liveEpoch: $0[4], manual: $0[5] == "1") }
     }
     func saveGrant(_ value: ClipboardGrant) throws {
         // 重复捕获只补授权/提升明确手动许可，不能重置已确认或正在投递的进度。
-        try run("INSERT INTO clipboard_deliveries(recordId,peerId,trustGeneration,announcedVersion,liveEpoch,manual) VALUES(?,?,?,?,?,?) ON CONFLICT(recordId,peerId,trustGeneration) DO UPDATE SET manual=MAX(manual,excluded.manual)", [value.recordId,value.peerId,value.trustGeneration,value.announcedVersion,value.liveEpoch,value.manual ? 1 : 0])
+        try run("INSERT INTO clipboard_deliveries(recordId,peerId,trustGeneration,announcedVersion,liveEpoch,manual,attempted) VALUES(?,?,?,?,?,?,0) ON CONFLICT(recordId,peerId,trustGeneration) DO UPDATE SET manual=MAX(manual,excluded.manual)", [value.recordId,value.peerId,value.trustGeneration,value.announcedVersion,value.liveEpoch,value.manual ? 1 : 0])
     }
     func remove(source: String, id: String, local: Bool) throws {
         try transaction {

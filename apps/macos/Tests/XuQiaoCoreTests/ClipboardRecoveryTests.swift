@@ -10,6 +10,8 @@ final class ClipboardRecoveryTests: XCTestCase {
         let boardName = "com.chenguangyao.xuqiao.test.recovery." + UUID().uuidString
         var running = true
         var reads = 0
+        var channels: [String: UUID] = [:]
+        var packets: [(UUID, [String: Any])] = []
         var engine: FileTransferEngine!
         var adapter: PlatformClipboard!
         var core: ClipboardCoordinator!
@@ -23,10 +25,11 @@ final class ClipboardRecoveryTests: XCTestCase {
             })
             engine = try FileTransferEngine(configuration: config, send: { _,_,_ in }, close: { _ in }, resume: { _ in }, changed: { _ in })
             let peers = peerIDs.map { StoredPeer(id: $0, name: "test", clipboardTrustGeneration: "g", tokenHash: "unused", paused: false, lastSeen: Date()) }
-            core = try ClipboardCoordinator(configuration: config, store: SecureStore(suffix: config.keychainSuffix), queue: queue, localID: "mac", localName: "test", engine: engine, peers: peers, send: { _,_ in }, changed: {}, captureQueue: io, platformClipboard: adapter)
+            core = try ClipboardCoordinator(configuration: config, store: SecureStore(suffix: config.keychainSuffix), queue: queue, localID: "mac", localName: "test", engine: engine, peers: peers, send: { [weak self] channel, packet in self?.packets.append((channel, packet)) }, changed: {}, captureQueue: io, platformClipboard: adapter)
             queue.sync {
                 for peer in peers {
                     let channel = UUID()
+                    channels[peer.id] = channel
                     core.authenticated(peer: peer.id, channel: channel)
                     core.control(peer: peer.id, channel: channel, message: ["type": "clip.hello", "protocol": "xq-clipboard/2", "maxTextBytes": 16384,
                         "acceptRecords": true, "receiverEpoch": String(repeating: "a", count: 32), "acceptedKinds": ["text"], "syncEnabled": true, "enabledKinds": ["text"]])
@@ -35,6 +38,34 @@ final class ClipboardRecoveryTests: XCTestCase {
         }
         func rows() -> [ClipboardRecord] { queue.sync { core.matchingRows(source: "", kind: "", query: "") } }
         func manual(_ text: String, context: String? = nil) { queue.sync { core.manualToAll(text: text, expectedContext: context ?? core.context) } }
+        func reconnect(_ peer: String = "phone") {
+            queue.sync {
+                core.disconnected(channels[peer]!); let channel = UUID(); channels[peer] = channel
+                core.authenticated(peer: peer, channel: channel)
+                core.control(peer: peer, channel: channel, message: ["type": "clip.hello", "protocol": "xq-clipboard/2", "maxTextBytes": 16384,
+                    "acceptRecords": true, "receiverEpoch": String(repeating: "a", count: 32), "acceptedKinds": ["text"], "syncEnabled": true, "enabledKinds": ["text"]])
+            }
+        }
+        func acknowledge(_ peer: String = "phone", applyError: Bool = false) {
+            queue.sync {
+                guard let channel = channels[peer], let packet = packets.last(where: { $0.0 == channel && $0.1["type"] as? String == "clip.record" })?.1 else { XCTFail("No outgoing record"); return }
+                var ack = packet; ack["type"] = "clip.recordAck"; ack["status"] = "stored"
+                if applyError { ack["applyError"] = "CLIP_IO" }
+                core.control(peer: peer, channel: channel, message: ack)
+            }
+        }
+        func reconnectBeforeHello(_ peer: String = "phone") {
+            queue.sync {
+                core.disconnected(channels[peer]!); let channel = UUID(); channels[peer] = channel
+                core.authenticated(peer: peer, channel: channel)
+            }
+        }
+        func finishHello(_ peer: String = "phone", accept: Bool = true) {
+            queue.sync {
+                core.control(peer: peer, channel: channels[peer]!, message: ["type": "clip.hello", "protocol": "xq-clipboard/2", "maxTextBytes": 16384,
+                    "acceptRecords": accept, "receiverEpoch": accept ? String(repeating: "a", count: 32) : "", "acceptedKinds": accept ? ["text"] : [], "syncEnabled": true, "enabledKinds": ["text"]])
+            }
+        }
         func blockIO() -> DispatchSemaphore {
             let hold = DispatchSemaphore(value: 0), entered = DispatchSemaphore(value: 0)
             io.async { entered.signal(); _ = hold.wait(timeout: .now() + 8) }
@@ -70,13 +101,199 @@ final class ClipboardRecoveryTests: XCTestCase {
         f.manual("same"); until("second manual was incorrectly deduplicated") { f.rows().count == 2 }
         XCTAssertNotEqual(first, f.rows().first!.content.recordId)
     }
+    func testLegacyDeliveryMigrationPreservesAckAndTreatsUnknownAttemptConservatively() throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent("xq-delivery-migration-" + UUID().uuidString).resolvingSymlinksInPath()
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let canonical = try FileStorage(directory: root.path).root
+        var legacy: ClipboardRecordStore? = try ClipboardRecordStore(root: canonical)
+        try legacy!.saveGrant(ClipboardGrant(recordId: "old", peerId: "phone", trustGeneration: "g"))
+        try legacy!.run("UPDATE clipboard_deliveries SET announcedVersion=0")
+        try legacy!.exec("ALTER TABLE clipboard_deliveries DROP COLUMN attempted"); legacy = nil
+        let migrated = try ClipboardRecordStore(root: canonical)
+        XCTAssertEqual(try migrated.grants(recordID: "old").first?.announcedVersion, 0)
+        XCTAssertEqual(try migrated.grants(recordID: "old", attemptedOnly: true).count, 1)
+        try migrated.saveGrant(ClipboardGrant(recordId: "new", peerId: "phone", trustGeneration: "g"))
+        XCTAssertEqual(try migrated.grants(recordID: "new", attemptedOnly: true).count, 0)
+    }
     func testAutomaticSameTextStillReusesAdjacentRecord() throws {
         let f = try Fixture(); defer { f.close() }; ready(f)
-        write(f, "same-auto"); until("automatic copy not captured") { f.rows().count == 1 }
+        write(f, "same-auto"); until("automatic copy not captured") { f.rows().count == 1 }; f.acknowledge()
         let id = f.rows().first!.content.recordId
+        let revision = f.queue.sync { f.core.noticeRevision }
         write(f, "same-auto")
-        until("automatic adjacent reuse missing") { f.queue.sync { f.core.notice == "已复用上一条相同记录" } }
+        until("automatic adjacent reuse missing") { f.queue.sync { f.core.noticeRevision >= revision + 2 && f.core.notice != "正在准备剪贴板记录…" } }
         XCTAssertEqual(f.rows().count, 1); XCTAssertEqual(f.rows().first!.content.recordId, id)
+    }
+    func testFirstAutomaticCopyAfterReconnectIsFreshThenAdjacentReuseReturns() throws {
+        let f = try Fixture(); defer { f.close() }; ready(f)
+        write(f, "same-after-reconnect"); until("first record missing") { f.rows().count == 1 }; f.acknowledge()
+        let original = f.rows().first!.content.recordId
+        f.reconnect(); write(f, "same-after-reconnect")
+        until("first post-reconnect copy reused old record") { f.rows().count == 2 }
+        XCTAssertNotEqual(original, f.rows().first!.content.recordId); f.acknowledge()
+        let revision = f.queue.sync { f.core.noticeRevision }
+        write(f, "same-after-reconnect")
+        until("following adjacent copy not processed") { f.queue.sync { f.core.noticeRevision >= revision + 2 } }
+        XCTAssertEqual(f.rows().count, 2)
+    }
+    func testFreshCopyDuringHandshakeStaysLiveWhenHelloWinsSnapshotRace() throws {
+        let f = try Fixture(); defer { f.close() }; ready(f)
+        write(f, "old-before-handshake"); until("old copy missing") { f.rows().count == 1 }; f.acknowledge()
+        f.reconnectBeforeHello(); let hold = f.blockIO(); defer { hold.signal() }
+        write(f, "new-different-during-handshake")
+        until("new capture not started") { f.queue.sync { f.core.notice == "正在准备剪贴板记录…" } }
+        f.finishHello(); hold.signal(); until("new copy missing") { f.rows().count == 2 }
+        let row = f.rows().first!
+        XCTAssertEqual(row.content.text, "new-different-during-handshake")
+        XCTAssertEqual(f.queue.sync { f.packets.last { $0.1["recordId"] as? String == row.content.recordId }?.1["deliveryMode"] as? String }, "live")
+    }
+    func testUnacknowledgedAttemptedCopyCreatesNewIntentAndIsSentAfterPendingAck() throws {
+        let f = try Fixture(); defer { f.close() }; ready(f)
+        write(f, "pending-same"); until("first copy missing") { f.rows().count == 1 }
+        let first = f.rows().first!.content.recordId
+        write(f, "pending-same"); until("new explicit intent missing") { f.rows().count == 2 }
+        let latest = f.rows().first!.content.recordId; XCTAssertNotEqual(first, latest)
+        f.acknowledge() // 只确认旧在途项；随后必须实际发送新意图。
+        XCTAssertEqual(f.queue.sync { f.packets.last { $0.1["type"] as? String == "clip.record" }?.1["recordId"] as? String }, latest)
+        f.acknowledge(); XCTAssertEqual(f.queue.sync { f.core.notice }, "已同步到 1 台设备")
+    }
+    func testSameUnstartedQueuedCopyReusesRecordWithoutClaimingDelivery() throws {
+        let f = try Fixture(); defer { f.close() }; ready(f)
+        f.manual("blocking-inflight"); until("blocking copy missing") { f.rows().count == 1 }
+        write(f, "queued-same"); until("queued copy missing") { f.rows().count == 2 }
+        let queued = f.rows().first!.content.recordId
+        let revision = f.queue.sync { f.core.noticeRevision }; write(f, "queued-same")
+        until("repeat queued copy missing") { f.queue.sync { f.core.noticeRevision >= revision + 2 } }
+        XCTAssertEqual(f.rows().count, 2); XCTAssertEqual(f.rows().first!.content.recordId, queued)
+        XCTAssertFalse(f.queue.sync { f.core.notice?.contains("已同步到") == true })
+        f.acknowledge()
+        XCTAssertEqual(f.queue.sync { f.packets.last { $0.1["type"] as? String == "clip.record" }?.1["recordId"] as? String }, queued)
+    }
+    func testPreHelloCopyCannotBePromotedAcrossLaterReceiverPolicyEpoch() throws {
+        try assertPreHelloCopyCannotCrossPolicy(firstAccepts: true)
+    }
+    func testInitiallyRejectedHelloCannotPromoteOldCaptureAfterPolicyEnablesReceive() throws {
+        try assertPreHelloCopyCannotCrossPolicy(firstAccepts: false)
+    }
+    private func assertPreHelloCopyCannotCrossPolicy(firstAccepts: Bool) throws {
+        let f = try Fixture(); defer { f.close() }; ready(f); f.reconnectBeforeHello()
+        let hold = f.blockIO(); defer { hold.signal() }
+        write(f, "copy-before-permission-change")
+        until("capture not started") { f.queue.sync { f.core.notice == "正在准备剪贴板记录…" } }
+        f.finishHello(accept: firstAccepts)
+        f.queue.sync {
+            f.core.control(peer: "phone", channel: f.channels["phone"]!, message: ["type": "clip.policy", "acceptRecords": true,
+                "receiverEpoch": String(repeating: "b", count: 32), "acceptedKinds": ["text"], "syncEnabled": true, "enabledKinds": ["text"]])
+        }
+        hold.signal(); until("record missing") { f.rows().count == 1 }
+        let id = f.rows().first!.content.recordId
+        XCTAssertEqual(f.queue.sync { f.packets.last { $0.1["recordId"] as? String == id }?.1["deliveryMode"] as? String }, "history")
+    }
+    func testUnacknowledgedAttemptedCopyAfterReconnectUsesNewRecordID() throws {
+        let f = try Fixture(); defer { f.close() }; ready(f)
+        write(f, "pending-across-reconnect"); until("first copy missing") { f.rows().count == 1 }
+        let id = f.rows().first!.content.recordId
+        f.reconnect(); let revision = f.queue.sync { f.core.noticeRevision }; write(f, "pending-across-reconnect")
+        until("repeat capture missing") { f.queue.sync { f.core.noticeRevision >= revision + 2 } }
+        XCTAssertEqual(f.rows().count, 2); XCTAssertNotEqual(f.rows().first!.content.recordId, id)
+        f.acknowledge() // 先完成重连时已在途的旧记录，再核对新意图。
+        XCTAssertEqual(f.queue.sync { f.packets.last { $0.1["type"] as? String == "clip.record" }?.1["deliveryMode"] as? String }, "live")
+    }
+    func testStoredAckReplacesWaitingNotice() throws {
+        let f = try Fixture(); defer { f.close() }; ready(f)
+        f.manual("notice-ack"); until("record not prepared") { f.rows().count == 1 }; f.acknowledge()
+        XCTAssertEqual(f.queue.sync { f.core.notice }, "已同步到 1 台设备")
+        XCTAssertTrue(f.queue.sync { f.core.noticeIsReceipt })
+    }
+    func testOneOfflinePeerDoesNotHideConfirmedOnlineDelivery() throws {
+        let f = try Fixture(peerIDs: ["phone", "other"]); defer { f.close() }; ready(f)
+        f.queue.sync { f.core.disconnected(f.channels["other"]!) }
+        f.manual("online-and-offline"); until("record not prepared") { f.rows().count == 1 }; f.acknowledge()
+        XCTAssertEqual(f.queue.sync { f.core.notice }, "已同步到 1 台设备；另 1 台设备连接后自动同步")
+    }
+    func testOldAckCannotOverwriteNewPreparation() throws {
+        let f = try Fixture(); defer { f.close() }; ready(f)
+        f.manual("first"); until("first record missing") { f.rows().count == 1 }
+        let hold = f.blockIO(); defer { hold.signal() }
+        f.manual("second"); f.acknowledge()
+        XCTAssertEqual(f.queue.sync { f.core.notice }, "正在准备剪贴板记录…")
+        hold.signal(); until("second record missing") { f.rows().count == 2 }; f.acknowledge()
+        XCTAssertEqual(f.queue.sync { f.core.notice }, "已同步到 1 台设备")
+    }
+    func testOnlinePeersWithDifferentReceivePoliciesHaveSeparateCounts() throws {
+        let f = try Fixture(peerIDs: ["phone", "other"]); defer { f.close() }; ready(f)
+        f.queue.sync {
+            f.core.control(peer: "other", channel: f.channels["other"]!, message: ["type": "clip.policy", "acceptRecords": false,
+                "receiverEpoch": "", "acceptedKinds": [], "syncEnabled": true, "enabledKinds": ["text"]])
+        }
+        f.manual("mixed-online-policies"); until("record not prepared") { f.rows().count == 1 }
+        XCTAssertEqual(f.queue.sync { f.core.notice }, "正在同步到 1 台设备；等待 1 台设备开启剪贴板同步")
+        f.acknowledge()
+        XCTAssertEqual(f.queue.sync { f.core.notice }, "已同步到 1 台设备；等待 1 台设备开启剪贴板同步")
+    }
+    func testConnectedPeerBeforeClipboardHandshakeIsNotReportedAsDisabled() throws {
+        let f = try Fixture(); defer { f.close() }; ready(f)
+        f.queue.sync {
+            f.core.disconnected(f.channels["phone"]!); let channel = UUID(); f.channels["phone"] = channel
+            f.core.authenticated(peer: "phone", channel: channel)
+        }
+        f.manual("before-clipboard-handshake"); until("record not prepared") { f.rows().count == 1 }
+        XCTAssertEqual(f.queue.sync { f.core.notice }, "1 台设备剪贴板尚未就绪")
+    }
+    func testOldAckCannotOverwriteNewOperationError() throws {
+        let f = try Fixture(); defer { f.close() }; ready(f)
+        f.manual("first"); until("first record missing") { f.rows().count == 1 }
+        f.manual("rejected", context: "stale-context"); let error = f.queue.sync { f.core.notice }
+        f.acknowledge(); XCTAssertEqual(f.queue.sync { f.core.notice }, error)
+        XCTAssertFalse(f.queue.sync { f.core.noticeIsReceipt })
+    }
+    func testRemovingOfflineTargetRefreshesPendingNoticeWithoutAnotherEvent() throws {
+        let f = try Fixture(); defer { f.close() }; ready(f)
+        f.queue.sync { f.core.disconnected(f.channels["phone"]!) }
+        f.manual("removed-offline-target"); until("record missing") { f.rows().count == 1 }
+        XCTAssertEqual(f.queue.sync { f.core.notice }, "1 台设备连接后自动同步")
+        f.queue.sync { f.core.updatePeers([]) }
+        XCTAssertEqual(f.queue.sync { f.core.notice }, "已保存到本机，原设备授权已变化")
+        XCTAssertEqual(f.rows().count, 1)
+    }
+    func testRemovingOfflineTargetDoesNotClaimAllOriginalTargetsReceived() throws {
+        let f = try Fixture(peerIDs: ["phone", "other"]); defer { f.close() }; ready(f)
+        f.queue.sync { f.core.disconnected(f.channels["other"]!) }
+        f.manual("partial-with-revoked-target"); until("record missing") { f.rows().count == 1 }; f.acknowledge()
+        f.queue.sync { f.core.updatePeers([StoredPeer(id: "phone", name: "test", clipboardTrustGeneration: "g", tokenHash: "unused", paused: false, lastSeen: Date())]) }
+        XCTAssertEqual(f.queue.sync { f.core.notice }, "已同步到 1 台设备；1 台设备授权已变化")
+    }
+    func testStoredRecordWithApplyErrorDoesNotClaimSystemClipboardSuccess() throws {
+        let f = try Fixture(); defer { f.close() }; ready(f)
+        f.manual("apply-error"); until("record missing") { f.rows().count == 1 }; f.acknowledge(applyError: true)
+        XCTAssertTrue(f.queue.sync { f.core.notice?.contains("系统剪贴板写入未完成") == true })
+    }
+    func testLateOldConnectionCaptureCannotConsumeFreshCopyOnNewConnection() throws {
+        let f = try Fixture(); defer { f.close() }; ready(f)
+        write(f, "same-late"); until("first copy missing") { f.rows().count == 1 }; f.acknowledge()
+        let hold = f.blockIO(); defer { hold.signal() }
+        write(f, "same-late"); until("old capture not started") { f.queue.sync { f.core.notice == "正在准备剪贴板记录…" } }
+        f.reconnect(); hold.signal(); f.io.sync {}; f.queue.sync {}
+        write(f, "same-late"); until("old capture consumed fresh-copy marker") { f.rows().count == 2 }
+    }
+    func testReconnectingOnePeerCreatesOnlyOneFreshSharedRecord() throws {
+        let f = try Fixture(peerIDs: ["phone", "other"]); defer { f.close() }; ready(f)
+        write(f, "same-multi"); until("first copy missing") { f.rows().count == 1 }; f.acknowledge(); f.acknowledge("other")
+        f.reconnect(); write(f, "same-multi"); until("fresh shared record missing") { f.rows().count == 2 }
+        f.acknowledge(); f.acknowledge("other")
+        let revision = f.queue.sync { f.core.noticeRevision }; write(f, "same-multi")
+        until("later copy not processed") { f.queue.sync { f.core.noticeRevision >= revision + 2 } }
+        XCTAssertEqual(f.rows().count, 2)
+    }
+    func testOfflineUnacknowledgedPeerCannotHideFreshCopyFromReconnectedAcknowledgedPeer() throws {
+        let f = try Fixture(peerIDs: ["phone", "other"]); defer { f.close() }; ready(f)
+        write(f, "mixed-ack-across-reconnect"); until("first copy missing") { f.rows().count == 1 }; f.acknowledge()
+        let original = f.rows().first!.content.recordId
+        f.queue.sync { f.core.disconnected(f.channels["other"]!) }; f.reconnect()
+        write(f, "mixed-ack-across-reconnect"); until("reconnected confirmed peer lost its fresh copy") { f.rows().count == 2 }
+        let latest = f.rows().first!.content.recordId; XCTAssertNotEqual(original, latest)
+        XCTAssertEqual(f.queue.sync { f.packets.last { $0.0 == f.channels["phone"] && $0.1["recordId"] as? String == latest }?.1["deliveryMode"] as? String }, "live")
     }
     func testBusyCaptureKeepsLatestAutomaticCopy() throws {
         let f = try Fixture(); defer { f.close() }; ready(f)

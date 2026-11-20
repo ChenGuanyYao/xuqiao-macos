@@ -32,8 +32,8 @@ cat > "$app_dir/Contents/Info.plist" <<'PLIST'
 <key>CFBundleExecutable</key><string>XuQiaoMac</string>
 <key>CFBundleIconFile</key><string>AppIcon</string>
 <key>CFBundlePackageType</key><string>APPL</string>
-<key>CFBundleShortVersionString</key><string>0.11.8</string>
-<key>CFBundleVersion</key><string>40</string>
+<key>CFBundleShortVersionString</key><string>0.11.10</string>
+<key>CFBundleVersion</key><string>42</string>
 <key>LSMinimumSystemVersion</key><string>15.0</string>
 <key>NSHighResolutionCapable</key><true/>
 <key>NSBluetoothAlwaysUsageDescription</key><string>续桥使用蓝牙发现已配对的手机并在后台唤醒重连，剪贴板和文件内容仍通过加密局域网传输。</string>

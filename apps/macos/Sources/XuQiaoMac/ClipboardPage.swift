@@ -73,6 +73,12 @@ struct ClipboardPage: View {
                 Spacer(); if queryReady { Text("\(model.snapshot.clipboardQueryCount) 条").font(.system(size: 11)).foregroundStyle(NativeTheme.muted) } else { ProgressView().controlSize(.mini).accessibilityLabel("正在查找") }
             }
             OperationNotice(text: Binding(get: { notice }, set: { notice = $0 })).id(noticeIdentity)
+            if notice != nil && !model.clipboardSource.isEmpty {
+                HStack(spacing: 8) {
+                    Text("当前只显示所选来源的记录").foregroundStyle(NativeTheme.muted)
+                    Button("查看全部来源") { model.clipboardSource = "" }.buttonStyle(.plain).foregroundStyle(NativeTheme.blue)
+                }.font(.system(size: 11)).padding(.horizontal, 14)
+            }
             // 延后创建屏幕外记录，避免切页时一次布局整页卡片。
             LazyVStack(spacing: 9) {
                 if queryReady && !visible.isEmpty { HStack(spacing: 8) {
