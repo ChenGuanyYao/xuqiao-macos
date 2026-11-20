@@ -73,6 +73,7 @@ public struct ServerSnapshot {
     public var clipboardQueryCount = 0
     public var clipboardCache = ClipboardCacheView()
     public var clipboardNoticeRevision: UInt64 = 0
+    public var clipboardNoticeIsReceipt = false
     public var clipboardNotice: String?
     public var clipboardPreferences = ClipboardPreferences()
     public var clipboardContext = ""

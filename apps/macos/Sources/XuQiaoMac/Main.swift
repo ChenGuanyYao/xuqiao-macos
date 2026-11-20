@@ -78,6 +78,7 @@ final class AppModel: ObservableObject {
     // 反馈属于整个主窗生命周期；切页不会丢失错误，关闭后同一revision不会复活。
     @Published var clipboardOperationNotice: String? { didSet { clipboardOperationNoticeID = UUID() } }
     @Published private(set) var clipboardOperationNoticeID = UUID()
+    private var lastCoreClipboardNoticeID: UUID?
     @Published var transferOperationNotice: String? { didSet { transferOperationNoticeID = UUID() } }
     @Published private(set) var transferOperationNoticeID = UUID()
     private var receivedOperationSnapshot = false
@@ -192,7 +193,11 @@ final class AppModel: ObservableObject {
             }
             // 在页面不在场时也消费服务事件；按revision而非文字判断，同值新错误仍替换。
             if !self.receivedOperationSnapshot || snapshot.clipboardNoticeRevision != self.snapshot.clipboardNoticeRevision {
-                self.clipboardOperationNotice = snapshot.clipboardNotice
+                // 本机文件操作或用户关闭提示后，迟到回执不能夺回显示权；新操作仍正常显示。
+                if clipboardNoticeCanUpdate(isReceipt: snapshot.clipboardNoticeIsReceipt, lastCoreNoticeID: self.lastCoreClipboardNoticeID, displayedNoticeID: self.clipboardOperationNoticeID) {
+                    self.clipboardOperationNotice = snapshot.clipboardNotice
+                    self.lastCoreClipboardNoticeID = self.clipboardOperationNoticeID
+                }
             }
             if !self.receivedOperationSnapshot || snapshot.files.noticeRevision != self.snapshot.files.noticeRevision {
                 if self.receivedOperationSnapshot || snapshot.files.error != nil {

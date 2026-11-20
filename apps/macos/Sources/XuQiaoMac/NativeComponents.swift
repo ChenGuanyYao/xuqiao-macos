@@ -174,9 +174,14 @@ func deviceLabel(_ name: String, id: String) -> String {
     name + " · " + String(id.suffix(8))
 }
 
+/// 回执仅更新自己仍占有的提示；新操作不受旧提示所有权限制。
+func clipboardNoticeCanUpdate(isReceipt: Bool, lastCoreNoticeID: UUID?, displayedNoticeID: UUID) -> Bool {
+    !isReceipt || lastCoreNoticeID == displayedNoticeID
+}
+
 /// 兼容Core现有结果文案：仅明确成功前缀可短暂显示，未知或部分失败结果保留。
 func operationNoticeIsTransient(_ text: String) -> Bool {
-    let prefixes = ["已清理", "已复制", "已保存", "文件已导出", "已写入系统剪贴板", "原图已保存到", "记录已删除"]
+    let prefixes = ["已清理", "已复制", "已保存", "已同步", "文件已导出", "已写入系统剪贴板", "原图已保存到", "记录已删除"]
     guard prefixes.contains(where: { text.hasPrefix($0) }) else { return false }
     // 只消除完整的零失败计数；失败1/10/01项、无计数失败、部分失败均不会被消除。
     let outcome = text.replacingOccurrences(of: #"失败\s*0\s*项"#, with: "", options: .regularExpression)

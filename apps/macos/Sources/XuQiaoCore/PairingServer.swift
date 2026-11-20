@@ -748,6 +748,7 @@ public final class PairingServer {
         snapshot.clipboardQueryCount = clipboard?.queryCount ?? 0
         snapshot.clipboardCache = clipboard?.cacheView() ?? ClipboardCacheView()
         snapshot.clipboardNoticeRevision = clipboard?.noticeRevision ?? 0
+        snapshot.clipboardNoticeIsReceipt = clipboard?.noticeIsReceipt ?? false
         snapshot.clipboardNotice = clipboard?.notice
         snapshot.clipboardPreferences = clipboard?.preferences ?? .disabled
         snapshot.clipboardPreferencesError = clipboard?.preferencesError

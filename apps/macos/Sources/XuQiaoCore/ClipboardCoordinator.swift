@@ -6,9 +6,17 @@ private final class RecordSession {
     var capable = false
     var localEpoch = ""
     var remoteEpoch = ""
+    var initialRemoteEpoch: String?
     var remoteAccept = false
     var remoteKinds = Set<String>()
     var previewCapable = false
+    var resumeTextCapable = false
+    var resumePrepared = false
+    var resumePreparing = false
+    var resumeRecord: ClipboardRecord?
+    var resumeReceived = false
+    var resumeGuard: ClipboardResumeGuard?
+    var needsFreshCapture = true
     var incoming = ClipboardPermit()
     var receiving = 0
     var preparingDownloads = 0
@@ -31,17 +39,31 @@ private struct CaptureTarget {
     var manual: Bool
     var epoch: String
     var autoVersion = ""
+    var connection: UUID? = nil
+    var awaitingHello = false
+}
+private struct CaptureNotice {
+    let recordID: String
+    let targets: [CaptureTarget]
+    var revision: UInt64
+    var applyErrors = Set<String>()
 }
 private struct CaptureCandidate {
     let row: ClipboardRecord
     let snapshot: ClipboardSnapshotIndex?
     let identity: stat?
 }
+private struct PendingCapture {
+    let input: ClipboardCapture
+    let targets: [CaptureTarget]
+    let automatic: Bool
+    let capturedAt: Int64
+}
 
 /// 唯一剪贴板编排器：记录先可靠落库，投递授权与文件任务分别持久，不借旧text通道旁路。
 final class ClipboardCoordinator {
     private let queue: DispatchQueue
-    private let io = DispatchQueue(label: "com.chenguangyao.xuqiao.clipboard.io", qos: .utility)
+    private let io: DispatchQueue
     private let adapter: PlatformClipboard
     private let database: ClipboardRecordStore
     private let snapshots: ClipboardSnapshotStore
@@ -58,6 +80,7 @@ final class ClipboardCoordinator {
     private let newLocalContent: ([String]) -> Void
     private var peers: [StoredPeer]
     private var sessions: [String: RecordSession] = [:]
+    private var disconnectGuards: [String: ClipboardResumeGuard] = [:]
     private var fileCapabilities: [String: (Bool,Bool)] = [:]
     private var memory: [String: RecordPeerMemory] = [:]
     private var active = false
@@ -72,6 +95,9 @@ final class ClipboardCoordinator {
     private var copyPermits: [String: ClipboardPermit] = [:]
     private var copySource: String?
     private var captureToken: WorkCancellation?
+    private var pendingAutomaticCapture: PendingCapture?
+    private var pendingManualCapture: PendingCapture?
+    private var captureNotice: CaptureNotice?
     private var suppressed: [String: Date] = [:]
     private var tasks: [FileTaskView] = []
     private var pendingRequests: [String: (ClipboardBinding, UUID, Date)] = [:]
@@ -112,10 +138,13 @@ final class ClipboardCoordinator {
     func pageViews() -> [ClipboardRecordView] { makeViews(Array(matchingRows(source: querySource, kind: queryKind, query: querySearch).dropFirst(queryPage * 50).prefix(50))) }
     private(set) var noticeRevision: UInt64 = 0
     // 同文案的连续结果也是新反馈，UI不能仅按字符串去重。
-    private(set) var notice: String? { didSet { noticeRevision &+= 1 } }
+    private(set) var noticeIsReceipt = false
+    private(set) var notice: String? { didSet { noticeRevision &+= 1; noticeIsReceipt = false } }
 
     init(configuration: ServerConfiguration, store: SecureStore, queue: DispatchQueue, localID: String, localName: String,
-         engine: FileTransferEngine, peers: [StoredPeer], send: @escaping (UUID, [String: Any]) -> Void, changed: @escaping () -> Void, newLocalContent: @escaping ([String]) -> Void = { _ in }) throws {
+         engine: FileTransferEngine, peers: [StoredPeer], send: @escaping (UUID, [String: Any]) -> Void, changed: @escaping () -> Void, newLocalContent: @escaping ([String]) -> Void = { _ in },
+         captureQueue: DispatchQueue? = nil, platformClipboard: PlatformClipboard? = nil) throws {
+        io = captureQueue ?? DispatchQueue(label: "com.chenguangyao.xuqiao.clipboard.io", qos: .utility)
         self.queue = queue; self.localID = localID; self.localName = localName; self.engine = engine; self.peers = peers; self.send = send; self.changed = changed; self.newLocalContent = newLocalContent
         snapshots = try ClipboardSnapshotStore(configuration: configuration)
         database = try ClipboardRecordStore(root: snapshots.storage.root)
@@ -126,7 +155,7 @@ final class ClipboardCoordinator {
         #else
         let name: String? = nil
         #endif
-        adapter = PlatformClipboard(name: name)
+        adapter = platformClipboard ?? PlatformClipboard(name: name)
         try database.run("UPDATE clipboard_deliveries SET liveEpoch=''")
         // 尚未可靠关联task的请求不能因重启继续下载；已经持久task由文件恢复流程负责。
         try database.run("UPDATE clipboard_records SET downloadState='failed',error='下载请求已失效，请重新下载' WHERE downloadState='requesting' AND localTaskId=''")
@@ -141,6 +170,7 @@ final class ClipboardCoordinator {
         adapter.start(); try sweep()
     }
     private func invalidateUI() {
+        pendingAutomaticCapture = nil; pendingManualCapture = nil
         privateImageCleanupCancellation.cancel()
         previews?.invalidate(); uiEpoch = UUID().uuidString; copyPermits.values.forEach { $0.cancel() }; copyPermits.removeAll(); copySource = nil; copying = false; copyAfter.removeAll()
         batchQueue.removeAll(); batchActive = nil; batchTotal = 0
@@ -245,7 +275,7 @@ final class ClipboardCoordinator {
             for peer in peers where !new.contains(scope(peer.id, peer.clipboardTrustGeneration ?? "legacy")) { invalidatePeerIntents(peer.id) }
         }
         peers = value
-        if old != new { baseline = baseline.filter { new.contains($0.key) }; resetObserver() }
+        if old != new { baseline = baseline.filter { new.contains($0.key) }; resetObserver(); refreshCaptureNotice() }
     }
     func fileCapability(peer: String, file: Bool, group: Bool) { fileCapabilities[peer] = (file,group); pumpOriginals() }
     func detailText(source: String, id: String, context: String) -> String? {
@@ -320,18 +350,20 @@ final class ClipboardCoordinator {
     func authenticated(peer: String, channel: UUID) {
         guard !stopped, let generation = generation(peer) else { return }
         invalidatePeerIntents(peer); sessions[peer]?.close(); sessions[peer] = RecordSession(channel)
+        sessions[peer]?.resumeGuard = disconnectGuards.removeValue(forKey: scope(peer, generation)) ?? adapter.makeResumeGuard()
         fileCapabilities.removeValue(forKey: peer)
         engine.setClipboardTrust(peer: peer, generation: generation)
         pumpBatch(); pumpOriginals(); pumpImageExports()
-        try? database.run("UPDATE clipboard_deliveries SET liveEpoch='' WHERE peerId=? AND trustGeneration=?", [peer,generation]); changed()
+        try? database.run("UPDATE clipboard_deliveries SET liveEpoch='' WHERE peerId=? AND trustGeneration=?", [peer,generation]); refreshCaptureNotice(); changed()
     }
     func disconnected(_ channel: UUID) {
         for (peer, session) in sessions where session.channel == channel {
+            if let gen = generation(peer) { disconnectGuards[scope(peer, gen)] = adapter.makeResumeGuard() }
             invalidatePeerIntents(peer)
             session.close(); sessions.removeValue(forKey: peer); fileCapabilities.removeValue(forKey: peer); update(peer) { $0.send = "连接已断开，原授权记录保留待补送" }
             try? database.run("UPDATE clipboard_deliveries SET liveEpoch='' WHERE peerId=?", [peer])
         }
-        invalidateRequests(channel); pumpBatch(); pumpOriginals(); pumpImageExports(); changed()
+        invalidateRequests(channel); pumpBatch(); pumpOriginals(); pumpImageExports(); refreshCaptureNotice(); changed()
     }
     private func invalidateRequests(_ channel: UUID? = nil) {
         for (id, item) in pendingRequests where channel == nil || item.1 == channel {
@@ -352,9 +384,10 @@ final class ClipboardCoordinator {
         try database.run("DELETE FROM clipboard_deliveries WHERE peerId=?", [peer])
         for (id, request) in pendingRequests where request.0.sourceDeviceId == peer { engine.cancelClipboardRequest(id); pendingRequests.removeValue(forKey: id) }
         fileCapabilities.removeValue(forKey: peer)
-        resetObserver(); pumpBatch(); pumpOriginals(); pumpImageExports(); changed()
+        resetObserver(); pumpBatch(); pumpOriginals(); pumpImageExports(); refreshCaptureNotice(); changed()
     }
     func stop() {
+        pendingAutomaticCapture = nil; pendingManualCapture = nil
         stopped = true; privateImageCleanupCancellation.cancel(); invalidateOriginalIntents(); previews.invalidate(); captureToken?.cancel(); sourcePermit.cancel(); copyPermits.values.forEach { $0.cancel() };
         invalidateSelfIntents(); for session in sessions.values { session.close() }; sessions.removeAll()
         invalidateRequests(); adapter.observe(false, epoch: UUID()); copyAfter.removeAll()
@@ -399,17 +432,19 @@ final class ClipboardCoordinator {
             guard setting(peer.id).autoSend, baseline[scope(peer.id, gen)].map({ count > $0 }) == true else { return nil }
             let key = scope(peer.id, gen)
             if autoVersions[key] == nil { autoVersions[key] = UUID().uuidString }
-            return CaptureTarget(peer: peer.id, generation: gen, manual: false, epoch: sessions[peer.id]?.remoteEpoch ?? "", autoVersion: autoVersions[key]!)
+            return CaptureTarget(peer: peer.id, generation: gen, manual: false, epoch: sessions[peer.id]?.remoteEpoch ?? "", autoVersion: autoVersions[key]!, connection: sessions[peer.id]?.channel, awaitingHello: sessions[peer.id]?.capable == false)
         }
         guard !targets.isEmpty else { return }; self.capture(capture, targets: targets, automatic: true)
     }
     func manual(peer: String, text: String? = nil, expectedContext: String? = nil) {
-        guard active, !stopped, expectedContext == nil || expectedContext == uiEpoch, let gen = generation(peer) else { notice = "请解锁并选择已信任设备"; changed(); return }
-        let target = CaptureTarget(peer: peer, generation: gen, manual: true, epoch: sessions[peer]?.remoteEpoch ?? "")
+        guard manualReady(expectedContext: expectedContext) else { return }
+        guard let gen = generation(peer) else { notice = "设备配对已变化，本次未发送，请重新选择设备"; changed(); return }
+        let target = CaptureTarget(peer: peer, generation: gen, manual: true, epoch: sessions[peer]?.remoteEpoch ?? "", connection: sessions[peer]?.channel, awaitingHello: sessions[peer]?.capable == false)
         if let text { capture(.text(text), targets: [target], automatic: false); return }
         let context = uiEpoch, permit = sourcePermit
         adapter.readCapture(permit: permit) { [weak self] item in self?.queue.async {
-            guard let self, self.uiEpoch == context, self.sourcePermit === permit else { return }
+            guard let self else { return }
+            guard self.uiEpoch == context, self.sourcePermit === permit else { self.notice = "状态已变化，本次未发送，请重新操作"; self.changed(); return }
             if let item { self.capture(item, targets: [target], automatic: false) }
             else { self.notice = "无法准备当前剪贴板，请使用可读取的文本、图片或普通文件/目录"; self.changed() }
         } }
@@ -432,12 +467,29 @@ final class ClipboardCoordinator {
             rows.removeAll { $0.key == oldest.key }
         }
     }
-    private func capture(_ input: ClipboardCapture, targets: [CaptureTarget], automatic: Bool) {
-        guard captureToken == nil else { notice = "正在准备上一条记录，请稍后重新复制或同步"; changed(); return }
+    private func capture(_ input: ClipboardCapture, targets: [CaptureTarget], automatic: Bool, capturedAt: Int64? = nil) {
+        let captured = capturedAt ?? milliseconds()
+        guard captureToken == nil else {
+            let pending = PendingCapture(input: input, targets: targets, automatic: automatic, capturedAt: captured)
+            if automatic { pendingAutomaticCapture = pending }
+            else if pendingManualCapture == nil {
+                // 只替换同一目标的旧自动意图；其他手机仍应收到自己的待同步内容。
+                if let older = pendingAutomaticCapture {
+                    let replaced = Set(targets.map { scope($0.peer, $0.generation) })
+                    let remaining = older.targets.filter { !replaced.contains(scope($0.peer, $0.generation)) }
+                    pendingAutomaticCapture = remaining.isEmpty ? nil : PendingCapture(input: older.input, targets: remaining, automatic: true, capturedAt: older.capturedAt)
+                }
+                pendingManualCapture = pending
+                notice = "已加入发送，上一条处理完成后继续"; changed()
+            }
+            else { notice = "已有一条内容等待发送，本次未加入，请稍后重试"; changed() }
+            return
+        }
         let token = WorkCancellation(); captureToken = token
         let id = (try? secureBytes(16)).map(hex) ?? ""; guard !id.isEmpty else { captureToken = nil; return }
-        let candidate = try? freezeCaptureCandidate()
-        let captured = milliseconds(); notice = "正在准备剪贴板记录…"
+        // 手动发送是新的明确意图，不能复用已ACK的旧ID；自动采集继续相邻去重。
+        let candidate = automatic ? try? freezeCaptureCandidate(targets: targets) : nil
+        notice = "正在准备剪贴板记录…"
         for target in targets { update(target.peer) { $0.send = "正在准备剪贴板记录…" } }; changed()
         io.async {
             let result = Result { try self.snapshots.prepare(input, id: id, source: self.localID, capturedAt: captured, cancellation: token) }
@@ -451,12 +503,10 @@ final class ClipboardCoordinator {
                     if case .success(let prepared) = result { self.discardPreparedSnapshot(prepared) }
                     return
                 }; self.captureToken = nil
+                defer { self.drainPendingCapture() }
                 do {
                     let prepared = try result.get(); guard !self.stopped, !token.isCancelled else { throw ClipboardFailure(code: "CLIP_STALE") }
                     self.suppressed = self.suppressed.filter { Date().timeIntervalSince($0.value) < 60 }
-                    if automatic && self.suppressed[prepared.content.kind + ":" + prepared.content.sha256] != nil {
-                        self.discardPreparedSnapshot(prepared); self.notice = nil; self.changed(); return
-                    }
                     let eligible = targets.filter { target in
                         self.generation(target.peer) == target.generation && self.preferences.kinds.contains(prepared.content.kind) && self.remoteAllows(target.peer,kind: prepared.content.kind) &&
                         (target.manual || self.preferences.enabled && self.autoVersions[self.scope(target.peer,target.generation)] == target.autoVersion)
@@ -464,18 +514,33 @@ final class ClipboardCoordinator {
                     guard !eligible.isEmpty else {
                         self.discardPreparedSnapshot(prepared); self.notice = "当前内容类型或接收设备已关闭同步"; self.changed(); return
                     }
+                    // 原生ownCounts仍阻止自身写入回环；重连首次真实复制不被旧内容摘要或相邻行吞掉。
+                    let fresh = eligible.contains(where: self.needsFreshCapture)
+                    if automatic && !fresh && self.suppressed[prepared.content.kind + ":" + prepared.content.sha256] != nil {
+                        self.discardPreparedSnapshot(prepared); self.notice = nil; self.changed(); return
+                    }
                     // 异步快照完成后，按提交队列此刻的最新行判断；先去重再裁历史/清配额。
-                    let reused = try self.database.transaction { () throws -> Bool in
+                    let reused = try self.database.transaction { () throws -> String? in
                         guard let latest = try self.database.latest(), latest.content.sourceDeviceId == self.localID,
                               latest.content.sameCapture(prepared.content), let candidate, candidateVerified,
-                              try self.reusableCapture(latest, candidate: candidate) else { return false }
+                              try self.reusableCapture(latest, candidate: candidate) else { return nil }
+                        guard try self.canReuseCapture(latest, targets: eligible) else { return nil }
                         try self.saveCaptureGrants(recordId: latest.content.recordId, targets: eligible)
-                        return true
+                        return latest.content.recordId
                     }
-                    if reused {
+                    if let reused {
                         self.discardPreparedSnapshot(prepared)
-                        for target in eligible { self.update(target.peer) { $0.send = "已复用上一条相同记录" } }
-                        self.notice = "已复用上一条相同记录"; self.pumpAll(); self.changed(); return
+                        for target in eligible { self.update(target.peer) { $0.send = "相同内容已保存" } }
+                        self.consumeFreshCapture(eligible)
+                        // 尚未开始发送的相同排队内容可复用；已尝试项由canReuseCapture转为新意图。
+                        for target in eligible {
+                            if let session = self.sessions[target.peer], session.channel == target.connection, session.inflight?.record == reused {
+                                session.inflight = nil; session.retryAt = nil
+                            }
+                        }
+                        self.newLocalContent(eligible.map(\.peer))
+                        self.trackCaptureNotice(recordID: reused, targets: eligible)
+                        self.pumpAll(); self.refreshCaptureNotice(); self.changed(); return
                     }
                     try self.ensureHistoryRoom()
                     if let snapshot = prepared.snapshot {
@@ -489,9 +554,12 @@ final class ClipboardCoordinator {
                         if let snapshot = prepared.snapshot { try self.database.saveSnapshot(snapshot) }
                         try self.saveCaptureGrants(recordId: id, targets: eligible)
                     }
+                    // 只在成功提交后消耗当前连接标记；旧连接迟到采集不能消耗新连接的首次机会。
+                    self.consumeFreshCapture(eligible)
                     // 只在新本机内容实际落库后通知；相邻复用/刷新/接收远端内容均不制造唤醒。
                     self.newLocalContent(eligible.map(\.peer))
-                    self.notice = "已保存记录，等待原授权设备接收"; self.pumpAll(); self.changed()
+                    self.trackCaptureNotice(recordID: id, targets: eligible)
+                    self.pumpAll(); self.refreshCaptureNotice(); self.changed()
                 } catch {
                     if case .success(let prepared) = result { self.discardPreparedSnapshot(prepared) }
                     self.notice = (error as? ClipboardFailure).map { clipboardErrorText($0.code) } ?? "准备失败：文件发生变化、不可读取或超过限制，请重新复制"
@@ -500,8 +568,36 @@ final class ClipboardCoordinator {
             }
         }
     }
-    private func freezeCaptureCandidate() throws -> CaptureCandidate? {
+    private func drainPendingCapture() {
+        guard active, !stopped, captureToken == nil else { return }
+        let next = pendingManualCapture ?? pendingAutomaticCapture
+        guard let next else { return }
+        if next.automatic { pendingAutomaticCapture = nil } else { pendingManualCapture = nil }
+        capture(next.input, targets: next.targets, automatic: next.automatic, capturedAt: next.capturedAt)
+    }
+    private func manualReady(expectedContext: String?) -> Bool {
+        guard !stopped else { return false }
+        guard expectedContext == nil || expectedContext == uiEpoch else { notice = "页面状态已变化，本次未发送，请重新操作"; changed(); return false }
+        guard active else {
+            adapter.requestRuntimeRefresh()
+            notice = "系统剪贴板尚未恢复，本次未发送，请解锁后重试"; changed(); return false
+        }
+        return true
+    }
+    private func canReuseCapture(_ row: ClipboardRecord, targets: [CaptureTarget]) throws -> Bool {
+        let grants = try database.grants(recordID: row.content.recordId)
+        let attempted = try database.grants(recordID: row.content.recordId, attemptedOnly: true)
+        return targets.allSatisfy { target in
+            let confirmed = grants.contains { $0.peerId == target.peer && $0.trustGeneration == target.generation && $0.announcedVersion >= row.availabilityVersion }
+            if confirmed { return !needsFreshCapture(target) }
+            // ACK丢失时对端可能已存但未应用；新复制必须用新ID，不能依赖duplicate-live回写。
+            return !attempted.contains { $0.peerId == target.peer && $0.trustGeneration == target.generation }
+        }
+    }
+    private func freezeCaptureCandidate(targets: [CaptureTarget]) throws -> CaptureCandidate? {
         guard let row = try database.latest(), row.content.sourceDeviceId == localID, row.available else { return nil }
+        // 仅复用未开始投递的同文排队项；已确认的重连首条及未确认的已尝试项均新建。
+        guard try canReuseCapture(row, targets: targets) else { return nil }
         if row.content.kind == "text" { return CaptureCandidate(row: row, snapshot: nil, identity: nil) }
         guard let index = try database.snapshot(id: row.content.recordId), index.state == "ready",
               index.expiresAt > milliseconds(), row.cacheExpiresAt > milliseconds(), index.byteSize == row.content.size,
@@ -543,11 +639,61 @@ final class ClipboardCoordinator {
     }
     private func saveCaptureGrants(recordId: String, targets: [CaptureTarget]) throws {
         for target in targets {
-            let live = sessions[target.peer]?.remoteEpoch == target.epoch && (target.manual || setting(target.peer).autoSend && autoVersions[scope(target.peer,target.generation)] == target.autoVersion) ? target.epoch : ""
+            let epoch = liveCaptureEpoch(target)
+            let live = (target.manual || setting(target.peer).autoSend && autoVersions[scope(target.peer,target.generation)] == target.autoVersion) ? epoch : ""
             try database.saveGrant(ClipboardGrant(recordId: recordId, peerId: target.peer, trustGeneration: target.generation, liveEpoch: live, manual: target.manual))
             // 相邻去重复用旧seq时，只刷新此次明确捕获的投递epoch，保留已有ACK版本。
             if !live.isEmpty { try database.run("UPDATE clipboard_deliveries SET liveEpoch=? WHERE recordId=? AND peerId=? AND trustGeneration=?", [live,recordId,target.peer,target.generation]) }
         }
+    }
+    private func liveCaptureEpoch(_ target: CaptureTarget) -> String {
+        guard let session = sessions[target.peer], session.channel == target.connection, generation(target.peer) == target.generation,
+              session.capable, session.remoteAccept else { return "" }
+        // 首次握手可与快照IO交错，只绑定同一连接首次协商出的epoch；旧非空epoch和旧连接绝不升级。
+        guard session.remoteEpoch == target.epoch || target.awaitingHello && target.epoch.isEmpty && session.remoteEpoch == session.initialRemoteEpoch else { return "" }
+        return session.remoteEpoch
+    }
+    private func consumeFreshCapture(_ targets: [CaptureTarget]) {
+        for target in targets where needsFreshCapture(target) && !liveCaptureEpoch(target).isEmpty { sessions[target.peer]?.needsFreshCapture = false }
+    }
+    private func needsFreshCapture(_ target: CaptureTarget) -> Bool {
+        guard let session = sessions[target.peer], session.channel == target.connection, generation(target.peer) == target.generation else { return false }
+        return session.needsFreshCapture
+    }
+    private func trackCaptureNotice(recordID: String, targets: [CaptureTarget]) {
+        notice = "已保存到剪贴板记录"
+        captureNotice = CaptureNotice(recordID: recordID, targets: targets, revision: noticeRevision)
+    }
+    private func refreshCaptureNotice() {
+        guard var tracked = captureNotice else { return }
+        // 新准备、排队、清理或其他操作已经取得提示所有权，旧ACK不能覆盖它。
+        guard tracked.revision == noticeRevision else { captureNotice = nil; return }
+        guard let row = try? database.find(source: localID, id: tracked.recordID), let grants = try? database.grants(recordID: tracked.recordID) else { return }
+        let targets = tracked.targets.filter { generation($0.peer) == $0.generation }
+        guard !targets.isEmpty else { captureNotice = nil; notice = "已保存到本机，原设备授权已变化"; return }
+        let pending = targets.filter { target in
+            !grants.contains { $0.peerId == target.peer && $0.trustGeneration == target.generation && $0.announcedVersion >= row.availabilityVersion }
+        }
+        let done = targets.count - pending.count
+        let offline = pending.filter { sessions[$0.peer] == nil }.count
+        let online = pending.count - offline
+        let preparing = pending.filter { sessions[$0.peer] != nil && sessions[$0.peer]?.capable == false }.count
+        let ready = pending.filter { sessions[$0.peer]?.capable == true && sessions[$0.peer]?.remoteAccept == true && sessions[$0.peer]?.remoteKinds.contains(row.content.kind) == true && remoteAllows($0.peer, kind: row.content.kind) }.count
+        var parts: [String] = []
+        if done > 0 { parts.append("已同步到 \(done) 台设备") }
+        // 在线不等于允许接收，混合状态分别计数，不能把等待授权的设备算成正在同步。
+        if ready > 0 { parts.append("正在同步到 \(ready) 台设备") }
+        if preparing > 0 { parts.append("\(preparing) 台设备剪贴板尚未就绪") }
+        if online > ready + preparing { parts.append("等待 \(online - ready - preparing) 台设备开启剪贴板同步") }
+        if offline > 0 { parts.append((done > 0 || online > 0 ? "另 " : "") + "\(offline) 台设备连接后自动同步") }
+        let failures = targets.filter { tracked.applyErrors.contains(scope($0.peer, $0.generation)) }.count
+        if failures > 0 { parts.append("\(failures) 台设备系统剪贴板写入未完成") }
+        let revoked = tracked.targets.count - targets.count
+        if revoked > 0 { parts.append("\(revoked) 台设备授权已变化") }
+        let text = parts.joined(separator: "；")
+        if notice != text { notice = text; noticeIsReceipt = true; tracked.revision = noticeRevision; captureNotice = tracked }
+        // 全部确认后停止追踪，后续无关消息和空闲事件不再查询这条记录。
+        if pending.isEmpty { captureNotice = nil }
     }
     private func discardPreparedSnapshot(_ prepared: ClipboardPrepared) {
         guard let index = prepared.snapshot else { return }
@@ -581,8 +727,10 @@ final class ClipboardCoordinator {
             do { try applyRemotePolicy(message,peer: peer,session: session,accept: accept) }
             catch { self.error(session,message: message,code: "CLIP_INVALID"); changed(); return }
             session.previewCapable = message["previewProtocol"] as? String == "xq-preview/1"
-            session.capable = true; session.remoteAccept = accept; session.remoteEpoch = epoch; session.localEpoch = receiverEpoch(peer)
+            session.resumeTextCapable = message["resumeTextProtocol"] as? String == "xq-resume-text/1"
+            session.capable = true; session.remoteAccept = accept; session.remoteEpoch = epoch; session.initialRemoteEpoch = epoch; session.localEpoch = receiverEpoch(peer)
             var fields = policy(peer, session); fields["protocol"] = clipboardProtocol; fields["maxTextBytes"] = clipboardLimit
+            fields["resumeTextProtocol"] = "xq-resume-text/1"
             send(channel, wire("clip.hello", fields)); pump(peer)
         case "clip.policy":
             guard session.capable, let accept = clipboardBool(message["acceptRecords"]), let epoch = message["receiverEpoch"] as? String,
@@ -605,7 +753,13 @@ final class ClipboardCoordinator {
                 if let row = try database.find(source: localID, id: flight.record), row.availabilityVersion == flight.version {
                     try database.run("UPDATE clipboard_deliveries SET announcedVersion=MAX(announcedVersion,?),liveEpoch='' WHERE recordId=? AND peerId=? AND trustGeneration=?", [flight.version,flight.record,peer,gen])
                 }
-                session.inflight = nil; update(peer) { $0.sent += 1; $0.send = "记录已同步" }; pump(peer)
+                if var tracked = captureNotice, tracked.revision == noticeRevision, tracked.recordID == flight.record,
+                   tracked.targets.contains(where: { $0.peer == peer && $0.generation == gen }) {
+                    let key = scope(peer, gen)
+                    if (message["applyError"] as? String)?.isEmpty == false { tracked.applyErrors.insert(key) } else { tracked.applyErrors.remove(key) }
+                    captureNotice = tracked
+                }
+                session.inflight = nil; update(peer) { $0.sent += 1; $0.send = (message["applyError"] as? String)?.isEmpty == false ? "记录已送达，系统剪贴板写入未完成" : "记录已同步" }; pump(peer)
             } catch { notice = "投递确认保存失败，保留待重试记录" }
         case "clip.download": serveDownload(peer: peer, session: session, message: message)
         case "clip.error":
@@ -624,7 +778,7 @@ final class ClipboardCoordinator {
             }
         default: error(session, message: message, code: "CLIP_INVALID")
         }
-        resetObserver(); pumpBatch(); pumpOriginals(); changed()
+        resetObserver(); pumpBatch(); pumpOriginals(); refreshCaptureNotice(); changed()
     }
     private func receive(peer: String, session: RecordSession, message: [String: Any]) {
         guard session.capable else { error(session, message: message, code: "CLIP_INVALID"); return }
@@ -633,9 +787,10 @@ final class ClipboardCoordinator {
         guard session.receiving + session.preparingDownloads < 32 else { error(session, message: message, code: "CLIP_BUSY"); return }
         do {
             guard let delivery = message["deliveryId"] as? String, validHex(delivery, count: 32),
-                  let mode = message["deliveryMode"] as? String, ["live", "history"].contains(mode), let available = clipboardBool(message["available"]),
+                  let mode = message["deliveryMode"] as? String, ["live", "history", "resume"].contains(mode), let available = clipboardBool(message["available"]),
                   let version = clipInteger(message["availabilityVersion"]), let expires = clipInteger(message["cacheExpiresAt"]) else { throw ClipboardFailure.invalid }
             let content = try ClipboardContent.parse(message)
+            guard mode != "resume" || session.resumeTextCapable && content.kind == "text" else { throw ClipboardFailure.invalid }
             guard preferences.kinds.contains(content.kind) else { error(session,message: message,code: "CLIP_DISABLED"); return }
             guard content.sourceDeviceId == peer, content.kind == "text" ? (available && version == 0 && expires == 0) : (expires > 0 && (version == 0 ? available : !available)) else { throw ClipboardFailure.invalid }
             var existing = try database.find(source: peer, id: content.recordId)
@@ -646,22 +801,27 @@ final class ClipboardCoordinator {
                     old.available = available; old.availabilityVersion = version; old.cacheExpiresAt = expires; try database.save(old); existing = old
                 }
                 update(peer) { $0.duplicates += 1 }
-                acknowledge(session, delivery: delivery, row: existing!, version: version, status: "duplicate"); enqueueOriginal(existing!); return
+                if mode != "resume" {
+                    acknowledge(session, delivery: delivery, row: existing!, version: version, status: "duplicate"); enqueueOriginal(existing!); return
+                }
             }
-            try ensureHistoryRoom()
+            if existing == nil { try ensureHistoryRoom() }
             let name = peers.first(where: { $0.id == peer })?.name ?? "设备"
-            let row = ClipboardRecord(content: content, sourceName: name, receivedAt: milliseconds(), available: available, availabilityVersion: version, cacheExpiresAt: expires)
-            try database.save(row); update(peer) { $0.received += 1; $0.receive = "已保存剪贴板记录" }
+            let row = existing ?? ClipboardRecord(content: content, sourceName: name, receivedAt: milliseconds(), available: available, availabilityVersion: version, cacheExpiresAt: expires)
+            try database.save(row); update(peer) { if existing == nil { $0.received += 1 }; $0.receive = "已保存剪贴板记录" }
             enqueueOriginal(row)
-            guard preferences.autoApplyText, content.kind == "text", mode == "live", let text = content.text else { acknowledge(session, delivery: delivery, row: row, version: version, status: "stored"); return }
-            session.receiving += 1; suppress(content)
+            guard preferences.autoApplyText, content.kind == "text", mode == "live" || mode == "resume" && !session.resumeReceived, let text = content.text else { acknowledge(session, delivery: delivery, row: row, version: version, status: "stored"); return }
+            if mode == "resume" { session.resumeReceived = true }
+            session.receiving += 1; if mode != "resume" { suppress(content) }
             let permit = session.incoming
-            adapter.write(text, permit: permit) { [weak self, weak session] result in self?.queue.async {
+            adapter.write(text, permit: permit, resumeGuard: mode == "resume" ? session.resumeGuard : nil) { [weak self, weak session] result in self?.queue.async {
                 guard let self, let session else { return }; session.receiving = max(0, session.receiving - 1)
                 guard self.sessions[peer] === session, session.incoming === permit, !self.stopped else { return }
-                self.update(peer) { $0.receive = result == true ? "记录已保存并写入剪贴板" : "记录已保存，自动写入失败，可手动复制" }
-                if result != true { var failed = row; failed.error = "自动写入失败，可手动复制"; try? self.database.save(failed) }
-                self.acknowledge(session, delivery: delivery, row: row, version: version, status: result == true ? "applied" : "stored", applyError: result == true ? nil : "CLIP_IO"); self.changed()
+                let protected = mode == "resume" && result == nil
+                if mode == "resume", result == true { self.suppress(content) }
+                self.update(peer) { $0.receive = protected ? "已保留本机新复制的内容" : result == true ? "记录已保存并写入剪贴板" : "记录已保存，自动写入失败，可手动复制" }
+                if result == false { var failed = row; failed.error = "自动写入失败，可手动复制"; try? self.database.save(failed) }
+                self.acknowledge(session, delivery: delivery, row: row, version: version, status: result == true ? "applied" : "stored", applyError: result == false ? "CLIP_IO" : nil); self.changed()
             } }
         } catch { self.error(session, message: message, code: (error as? ClipboardFailure)?.code ?? "CLIP_IO") }
     }
@@ -684,6 +844,25 @@ final class ClipboardCoordinator {
         session.historyGeneration = generation
     }
     private func pumpAll() { for peer in sessions.keys { pump(peer) } }
+    /// 每次连接只读取一次当前项，不从历史寻找替代文本，也不把收到的内容转发成自己的内容。
+    private func prepareResume(_ peer: String, session: RecordSession, generation: String) {
+        guard !session.resumePreparing else { return }; session.resumePreparing = true
+        guard setting(peer).autoSend, preferences.kinds.contains("text"), session.remoteKinds.contains("text"), remoteAllows(peer, kind: "text"),
+              let row = try? database.latest(), row.content.sourceDeviceId == localID, row.content.kind == "text", row.available,
+              (try? database.grants().contains { $0.recordId == row.content.recordId && $0.peerId == peer && $0.trustGeneration == generation }) == true else {
+            session.resumePrepared = true; session.resumePreparing = false; pump(peer); return
+        }
+        let permit = session.incoming, epoch = session.remoteEpoch
+        adapter.readCapture(permit: permit) { [weak self, weak session] capture in self?.queue.async {
+            guard let self, let session, self.sessions[peer] === session else { return }
+            guard session.incoming === permit, session.remoteEpoch == epoch else {
+                session.resumePreparing = false; self.pump(peer); return
+            }
+            session.resumePrepared = true; session.resumePreparing = false
+            if case .text(let text) = capture, text == row.content.text, self.setting(peer).autoSend { session.resumeRecord = row }
+            self.pump(peer)
+        } }
+    }
     private func pump(_ peer: String) {
         guard !stopped, active, let session = sessions[peer], session.capable, session.remoteAccept, session.inflight == nil, let gen = generation(peer) else { return }
         // 普通空闲tick不进入历史投递扫描；只有数据/授权/ACK事件或明确失败期限才驱动。
@@ -692,6 +871,20 @@ final class ClipboardCoordinator {
         deliveryScanCount += 1
         #endif
         do {
+            if session.resumeTextCapable && !session.resumePrepared { prepareResume(peer, session: session, generation: gen); return }
+            if let row = session.resumeRecord {
+                session.resumeRecord = nil
+                if setting(peer).autoSend && preferences.kinds.contains("text") && session.remoteKinds.contains("text") && remoteAllows(peer, kind: "text"),
+                   let latest = try database.latest(), latest.content.recordId == row.content.recordId, latest.content.same(row.content), latest.available,
+                   try database.grants().contains(where: { $0.recordId == row.content.recordId && $0.peerId == peer && $0.trustGeneration == gen }) {
+                    let delivery = hex(try secureBytes(16))
+                    try database.run("UPDATE clipboard_deliveries SET attempted=1 WHERE recordId=? AND peerId=? AND trustGeneration=?", [row.content.recordId,peer,gen])
+                    session.inflight = (delivery,row.content.recordId,row.content.sha256,row.availabilityVersion,Date(),false)
+                    send(session.channel, wire("clip.record", row.wire(delivery: delivery, epoch: session.remoteEpoch, mode: "resume")))
+                    refreshCaptureNotice()
+                    changed(); return
+                }
+            }
             if session.historyBoundary == nil || session.historyGeneration != gen { try freezeHistoryWindow(peer,session: session,generation: gen) }
             guard let boundary = session.historyBoundary else { return }
             let rows = try database.records().filter { $0.content.sourceDeviceId == localID }.sorted { $0.seq < $1.seq }
@@ -703,9 +896,10 @@ final class ClipboardCoordinator {
                 // 新seq/当前epoch明确意图不受历史上限限制；已确认旧条目的失效更新仍须可靠公告。
                 guard row.seq > boundary || session.historyRecordIDs.contains(row.content.recordId) || grant.announcedVersion >= 0 || live else { continue }
                 let delivery = hex(try secureBytes(16))
+                try database.run("UPDATE clipboard_deliveries SET attempted=1 WHERE recordId=? AND peerId=? AND trustGeneration=?", [row.content.recordId,peer,gen])
                 session.inflight = (delivery,row.content.recordId,row.content.sha256,row.availabilityVersion,Date(),grant.manual)
                 send(session.channel, wire("clip.record", row.wire(delivery: delivery, epoch: session.remoteEpoch, mode: live ? "live" : "history")))
-                update(peer) { $0.send = "正在同步记录…" }; changed(); return
+                update(peer) { $0.send = "正在同步记录…" }; refreshCaptureNotice(); changed(); return
             }
         } catch {
             session.retryAt = Date().addingTimeInterval(1)
@@ -912,16 +1106,17 @@ final class ClipboardCoordinator {
     }
 
     func manualToAll(text: String?, expectedContext: String) {
-        guard active, !stopped, expectedContext == uiEpoch else { return }
+        guard manualReady(expectedContext: expectedContext) else { return }
         let targets = peers.compactMap { peer -> CaptureTarget? in
             guard let generation = generation(peer.id) else { return nil }
-            return CaptureTarget(peer: peer.id, generation: generation, manual: true, epoch: sessions[peer.id]?.remoteEpoch ?? "")
+            return CaptureTarget(peer: peer.id, generation: generation, manual: true, epoch: sessions[peer.id]?.remoteEpoch ?? "", connection: sessions[peer.id]?.channel, awaitingHello: sessions[peer.id]?.capable == false)
         }
         guard !targets.isEmpty else { notice = "请先连接或配对一台手机"; changed(); return }
         if let text { capture(.text(text), targets: targets, automatic: false); return }
         let permit = sourcePermit
         adapter.readCapture(permit: permit) { [weak self] item in self?.queue.async {
-            guard let self, self.uiEpoch == expectedContext, self.sourcePermit === permit else { return }
+            guard let self else { return }
+            guard self.uiEpoch == expectedContext, self.sourcePermit === permit else { self.notice = "状态已变化，本次未发送，请重新操作"; self.changed(); return }
             if let item { self.capture(item, targets: targets, automatic: false) }
             else { self.notice = "当前剪贴板没有可同步的内容"; self.changed() }
         } }
@@ -1146,6 +1341,7 @@ final class ClipboardCoordinator {
             }
         }
         for (_, pending) in pendingRequests where Date().timeIntervalSince(pending.2) > 30 { timedOut = true; invalidateRequests(pending.1) }
+        if timedOut { refreshCaptureNotice() }
         if Date().timeIntervalSince(lastSweep) >= 60 { do { try sweep() } catch { notice = "缓存清理失败，未删除用户收件箱" } }
         if timedOut { pumpOriginals() }
         previews.tick()
@@ -1189,7 +1385,7 @@ final class ClipboardCoordinator {
     func debugWrite(_ text: String) { guard !stopped, clipboardBytes(text) != nil else { return }; adapter.write(text, permit: sourcePermit, markOwn: false) { _ in } }
     func debugPaths(peer: String, paths: [String]) {
         guard let gen = generation(peer), (1...GROUP_MAX_ROOTS).contains(paths.count), paths.allSatisfy({ $0.hasPrefix("/") && !$0.utf8.contains(0) }) else { return }
-        capture(.paths(paths.map { URL(fileURLWithPath: $0) }), targets: [CaptureTarget(peer: peer, generation: gen, manual: true, epoch: sessions[peer]?.remoteEpoch ?? "")], automatic: false)
+        capture(.paths(paths.map { URL(fileURLWithPath: $0) }), targets: [CaptureTarget(peer: peer, generation: gen, manual: true, epoch: sessions[peer]?.remoteEpoch ?? "", connection: sessions[peer]?.channel, awaitingHello: sessions[peer]?.capable == false)], automatic: false)
     }
     func debugSweep() { do { try sweep(); changed() } catch { notice = "缓存清理失败"; changed() } }
     #endif
