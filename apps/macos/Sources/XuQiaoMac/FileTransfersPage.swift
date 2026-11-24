@@ -28,14 +28,11 @@ struct FileTransfersPage: View {
     @State private var cleaning = false
     private var exporting: Bool { model.snapshot.files.batchExport?.state == "exporting" }
     private var sendablePeers: [PeerView] {
-        model.snapshot.peers.filter { peer in peer.connected && peer.fileCapable && !model.snapshot.files.preparingPeerIds.contains(peer.id) &&
-            !model.snapshot.files.tasks.contains(where: { $0.peerId == peer.id && !$0.state.terminal }) }
+        model.snapshot.peers.filter { peer in peer.connected && peer.fileCapable && model.canChooseFile(peerID: peer.id) }
     }
     private var sendUnavailable: String {
         guard model.snapshot.peers.contains(where: { $0.connected && $0.fileCapable }) else { return "连接手机后可发送" }
-        let active = model.snapshot.files.tasks.filter { !$0.state.terminal }
-        return model.snapshot.files.preparingPeerIds.isEmpty && !active.isEmpty && active.allSatisfy { $0.clipboardRecordId != nil }
-            ? "剪贴板正在同步，完成后可发送" : "设备正忙，请稍后发送"
+        return "正在选择或准备文件，或设备普通任务已达50项"
     }
     private var history: [FileTaskView] { model.snapshot.files.tasks.filter(\.isFileTransferRecord) }
     private var visible: [FileTaskView] {
@@ -64,7 +61,7 @@ struct FileTransfersPage: View {
                 Spacer()
                 if sendablePeers.isEmpty { Text(sendUnavailable).font(.system(size: 11)).foregroundStyle(NativeTheme.muted) }
                 Button { sending = true } label: { Label("发送文件", systemImage: "plus") }.buttonStyle(.borderedProminent)
-                    .disabled(sendablePeers.isEmpty).help(sendablePeers.isEmpty ? sendUnavailable : "选择文件发送到空闲设备")
+                    .disabled(sendablePeers.isEmpty).help(sendablePeers.isEmpty ? sendUnavailable : "选择文件发送，通道占满时自动排队")
             }.padding(.bottom, 4)
             HStack(spacing: 11) {
                 NativeSearchField(placeholder: "搜索文件名、组内文件或设备", text: $search, identifier: "files-search")
@@ -80,7 +77,7 @@ struct FileTransfersPage: View {
                 HStack(spacing: 10) { ProgressView().controlSize(.small); Text("正在准备文件 · " + (model.snapshot.peers.first { $0.id == preparation.peerId }?.name ?? "设备")).font(.system(size: 12)); Spacer(); Button("取消") { model.server.cancelPreparation(peerID: preparation.peerId, expectedPreparation: preparation.id) } }.padding(13).background(NativeTheme.blueLight, in: RoundedRectangle(cornerRadius: 9))
             }
             OperationNotice(text: Binding(get: { notice }, set: { notice = $0 })).id(noticeIdentity)
-            if let batch = model.snapshot.files.batchExport { BatchExportStatus(status: batch).environmentObject(model) }
+            if let batch = model.snapshot.files.batchExport, model.hiddenBatchExportID != batch.id { BatchExportStatus(status: batch).environmentObject(model) }
             // 传输历史可持续增长；只实例化视口附近卡片及其预览任务，切页不再布局全部历史。
             LazyVStack(spacing: 9) {
                 if !visible.isEmpty { HStack(spacing: 10) {
@@ -146,10 +143,12 @@ struct FileTransfersPage: View {
                         Text((isGroup ? groupContentsCount(task.roots) + " · " : "") + (task.direction == .outgoing ? "发送给 " : "来自 ") + peerName(task) + " · " + readableBytes(task.totalBytes ?? task.size) + (isGroup ? "" : task.entryCount.map { " · \($0) 项" } ?? "")).font(.system(size: 11)).foregroundStyle(NativeTheme.muted).lineLimit(1)
                         if [.transferring, .awaitingData, .verifying, .committing].contains(task.state) { ProgressView(value: Double(task.progress), total: Double(max(1, task.size))).frame(maxWidth: 270) }
                         if let error = task.error { Text(error).font(.system(size: 11)).foregroundStyle(.orange).lineLimit(2).textSelection(.enabled) }
+                        if let error = task.receivedSaveError { Text(error).font(.system(size: 11)).foregroundStyle(.orange).lineLimit(2).textSelection(.enabled) }
                     }
                 }.frame(maxWidth: .infinity, alignment: .leading).contentShape(Rectangle())
             }.buttonStyle(.plain).help(peerName(task) + " · 查看详情").accessibilityLabel("查看传输详情 " + title + (isGroup ? "，" + groupContentsCount(task.roots) : ""))
-            Text(task.state.title).font(.system(size: 11)).foregroundStyle(task.state == .completed ? Color.green : task.state == .failed ? .orange : NativeTheme.muted)
+            Text(task.state == .completed && task.receivedSaveState == "failed" ? "保存失败" : task.state == .completed && ["pending", "saving"].contains(task.receivedSaveState ?? "") ? "保存中" : task.state.title)
+                .font(.system(size: 11)).foregroundStyle(task.receivedSaveState == "failed" ? Color.orange : task.state == .completed ? Color.green : task.state == .failed ? .orange : NativeTheme.muted)
             taskPrimary(task)
             Menu {
                 if task.kind == "group" { Button("详情") { details = task } }
@@ -159,7 +158,7 @@ struct FileTransfersPage: View {
                     Button("重试可靠保存") { model.server.retryFile(taskID: task.id, expectedAttempt: task.attemptId) }
                 }
                 if task.direction == .outgoing && [.failed, .rejected, .interrupted, .waitingConnection].contains(task.state) { Button("重试") { model.server.retryFile(taskID: task.id, expectedAttempt: task.attemptId) }.disabled(!canRetry(task)) }
-                if task.state == .completed && task.direction == .incoming { if isVideoFile(task.name) { Button("打开视频") { model.openFile(task) } }; Button("在 Finder 中显示") { model.reveal(task) }; Button(task.kind == "group" ? "保存全部…" : "另存为…") { if task.kind == "group" { model.saveMany([FileTaskSelection(id: task.id, attemptId: task.attemptId)]) } else { model.export(task) } } }
+                if task.state == .completed && task.direction == .incoming { Button("打开") { model.openFile(task) }; Button("在 Finder 中显示") { model.reveal(task) }; Button(task.kind == "group" ? "另存全部…" : "另存为…") { if task.kind == "group" { model.saveMany([FileTaskSelection(id: task.id, attemptId: task.attemptId)]) } else { model.export(task) } } }
                 Divider(); Button("清理记录…", role: .destructive) { prompt = FileClearPrompt(items: [FileTaskSelection(id: task.id, attemptId: task.attemptId)], epoch: managementEpoch, all: false) }
             } label: { Image(systemName: "ellipsis").frame(width: 20, height: 28) }.menuStyle(.borderlessButton).menuIndicator(.hidden).frame(width: 26).help("传输更多操作").accessibilityLabel("传输更多操作")
         }.padding(.horizontal, 15).padding(.vertical, 15).frame(minHeight: 81)
@@ -167,15 +166,28 @@ struct FileTransfersPage: View {
             .overlay(RoundedRectangle(cornerRadius: 12).strokeBorder(selected[task.id] == task.attemptId ? NativeTheme.blue.opacity(0.28) : NativeTheme.line, lineWidth: 0.8).allowsHitTesting(false))
     }
     @ViewBuilder private func taskPrimary(_ task: FileTaskView) -> some View {
+        let opensFolder = task.kind == "group" && (task.roots.count != 1 || task.entries.contains { $0.isDirectory && $0.path == task.roots[0] + "/" })
         if task.state == .awaitingUser { Button(task.kind == "group" ? "接收全部" : "接收") { model.server.acceptFile(taskID: task.id, expectedAttempt: task.attemptId) }.buttonStyle(.borderedProminent).controlSize(.small) }
+        else if task.state == .completed && task.isOrdinaryReceivedFile {
+            if task.receivedSaveState == "failed" {
+                Button("重试保存") { model.server.retryReceivedSave(taskID: task.id, expectedAttempt: task.attemptId) }.disabled(task.managementBusy)
+            } else {
+                Button { model.openFile(task) } label: {
+                    Image(systemName: opensFolder ? "folder" : "arrow.up.forward.app").frame(width: 32, height: 32)
+                        .font(.system(size: 13, weight: .medium))
+                        .foregroundStyle(NativeTheme.blue).background(NativeTheme.blueLight, in: RoundedRectangle(cornerRadius: 9))
+                }.buttonStyle(.plain).disabled(task.managementBusy)
+                    .accessibilityLabel(opensFolder ? "打开文件夹" : "打开文件")
+                    .help(opensFolder ? "打开已收到文件所在的文件夹" : "打开已收到的文件").accessibilityIdentifier("received-file-open")
+            }
+        }
         else if task.state == .completed && task.direction == .incoming { Button { model.saveMany([FileTaskSelection(id: task.id, attemptId: task.attemptId)]) } label: { Image(systemName: "square.and.arrow.down").frame(width: 30, height: 31).background(NativeTheme.blueLight, in: RoundedRectangle(cornerRadius: 7)) }.buttonStyle(.plain).foregroundStyle(NativeTheme.blue).help("保存到所选目录") }
         else if !task.state.terminal && task.state != .committing { Button { model.server.cancelFile(taskID: task.id, expectedAttempt: task.attemptId) } label: { Image(systemName: "xmark").frame(width: 30, height: 31) }.buttonStyle(.plain).foregroundStyle(NativeTheme.muted).help("取消传输") }
     }
     private func invalidate() { managementEpoch = UUID(); selected.removeAll(); prompt = nil }
     private func canRetry(_ task: FileTaskView) -> Bool {
         model.snapshot.peers.contains { $0.id == task.peerId && $0.connected && $0.fileCapable } &&
-            !model.snapshot.files.preparingPeerIds.contains(task.peerId) &&
-            !model.snapshot.files.tasks.contains { $0.peerId == task.peerId && $0.id != task.id && !$0.state.terminal }
+            model.snapshot.files.canPrepareSend(peerID: task.peerId, excludingTaskID: task.id)
     }
     private func prepareClear(all: Bool) {
         let items = (all ? history.map { FileTaskSelection(id: $0.id, attemptId: $0.attemptId) } : selected.sorted { $0.key < $1.key }.map { FileTaskSelection(id: $0.key, attemptId: $0.value) })
@@ -283,14 +295,10 @@ private struct FileSendPickerSheet: View {
     @State private var peerID = ""
     @State private var expectedGeneration = ""
     private var peer: PeerView? { model.snapshot.peers.first { $0.id == peerID && $0.trustGeneration == expectedGeneration } }
-    private var busy: Bool { model.snapshot.files.preparingPeerIds.contains(peerID) || model.snapshot.files.tasks.contains { $0.peerId == peerID && !$0.state.terminal } }
-    private var busyMessage: String {
-        model.snapshot.files.tasks.contains { $0.peerId == peerID && $0.clipboardRecordId != nil && !$0.state.terminal }
-            ? "剪贴板正在同步，完成后可发送" : "这台设备正忙，请稍后再发送。"
-    }
+    private var busy: Bool { !model.canChooseFile(peerID: peerID) }
+    private var busyMessage: String { "正在选择或准备文件，或该设备普通任务已达50项。" }
     private func available(_ item: PeerView) -> Bool {
-        item.connected && item.fileCapable && !model.snapshot.files.preparingPeerIds.contains(item.id) &&
-            !model.snapshot.files.tasks.contains { $0.peerId == item.id && !$0.state.terminal }
+        item.connected && item.fileCapable && model.canChooseFile(peerID: item.id)
     }
     var body: some View {
         VStack(alignment: .leading, spacing: 22) {
@@ -298,7 +306,7 @@ private struct FileSendPickerSheet: View {
             if model.snapshot.peers.isEmpty { Text("请先连接手机。").font(.system(size: 13)).foregroundStyle(NativeTheme.muted); Button("连接新手机") { dismiss(); model.showPairing() }.buttonStyle(.borderedProminent) }
             else {
                 Picker("目标设备", selection: $peerID) { Text("选择设备").tag(""); ForEach(model.snapshot.peers) { item in Text(deviceLabel(item.name, id: item.id) + (available(item) ? " · 可发送" : item.connected ? " · 暂不可发送" : " · 未连接")).tag(item.id).disabled(!available(item)) } }
-                Text(busy ? busyMessage : peer?.connected == true ? peer?.groupCapable == true ? "可选择多个文件和文件夹，最多 100 个顶层项目。" : "对端支持单文件传输。" : "设备未连接，请恢复连接后再发送。").font(.system(size: 12)).foregroundStyle(NativeTheme.muted)
+                Text(busy ? busyMessage : peer?.connected == true ? peer?.groupCapable == true ? "可选择多个文件和文件夹，最多 100 个顶层项目。" : "对端支持单文件传输，通道占满时自动排队。" : "设备未连接，请恢复连接后再发送。").font(.system(size: 12)).foregroundStyle(NativeTheme.muted)
                 HStack { Spacer(); Button("选择文件…") { guard let peer else { return }; dismiss(); model.chooseFile(peerID: peer.id, allowGroups: peer.groupCapable, expectedGeneration: peer.trustGeneration) }.buttonStyle(.borderedProminent).disabled(peer?.connected != true || peer?.fileCapable != true || busy) }
             }
         }.padding(26).frame(width: 450)
@@ -306,20 +314,33 @@ private struct FileSendPickerSheet: View {
             .onChange(of: peerID) { _, id in expectedGeneration = model.snapshot.peers.first { $0.id == id }?.trustGeneration ?? "" }
     }
 }
+// 部分成功、取消和未知终态都必须保留，不能仅凭终态或零失败数自动隐藏。
+func batchExportSucceeded(_ status: BatchExportView) -> Bool {
+    status.state == "completed" && !status.cancelled && status.failed == 0 && status.total > 0 &&
+        status.completed == status.total && status.items.count == status.total && status.items.allSatisfy { $0.state == "completed" }
+}
+
 private struct BatchExportStatus: View {
     @EnvironmentObject var model: AppModel
     let status: BatchExportView
     var body: some View {
-        NativeCard {
+        if batchExportSucceeded(status) {
+            HStack(spacing: 10) {
+                Label(status.total == 1 ? "文件已保存" : "已保存 \(status.total) 个项目", systemImage: "checkmark.circle.fill")
+                    .font(.system(size: 12)).foregroundStyle(.green)
+                Spacer()
+                dismissButton
+            }.padding(13).background(NativeTheme.blueLight, in: RoundedRectangle(cornerRadius: 9))
+        } else { NativeCard {
             VStack(alignment: .leading, spacing: 12) {
                 HStack {
-                    Label(status.state == "exporting" ? "正在保存到续桥目录" : "最近一次保存结果", systemImage: "folder.badge.plus").font(.headline)
+                    Label(status.state == "exporting" ? "正在保存文件" : status.cancelled ? "保存已取消" : "保存未完成", systemImage: "folder.badge.plus").font(.headline)
                     Spacer()
                     if status.state == "exporting" {
                         Button("取消剩余保存", role: .destructive) { model.server.cancelExport(exportID: status.id) }.disabled(status.cancelled)
-                    }
+                    } else { dismissButton }
                 }
-                ProgressView(value: Double(status.completed), total: Double(max(1, status.total)))
+                if status.state == "exporting" { ProgressView(value: Double(status.completed), total: Double(max(1, status.total))) }
                 Text(status.message).font(.callout).foregroundStyle(status.failed > 0 ? Color.orange : Color.secondary)
                 if status.state != "exporting" {
                     ForEach(status.items.filter { $0.state != "completed" }) { item in
@@ -327,7 +348,11 @@ private struct BatchExportStatus: View {
                     }
                 }
             }
-        }
+        } }
+    }
+    private var dismissButton: some View {
+        Button { model.dismissBatchExport(status.id) } label: { Image(systemName: "xmark").frame(width: 24, height: 24) }
+            .buttonStyle(.plain).help("关闭提示").accessibilityLabel("关闭保存提示")
     }
 }
 struct GroupDetailsSheet: View {

@@ -49,9 +49,6 @@ struct ClipboardPage: View {
             if let error = model.snapshot.error {
                 HStack { NativeNotice(text: error, warning: true); if !model.snapshot.ready { Button("重试连接") { model.server.retry() } } }
             }
-            if model.snapshot.files.tasks.contains(where: { $0.isFileTransferRecord && $0.state == .awaitingUser }) {
-                HStack { Label("有文件待接收", systemImage: "arrow.down.doc"); Spacer(); Button("查看") { model.selection = .files } }.font(.system(size: 12)).padding(12).background(NativeTheme.blueLight, in: RoundedRectangle(cornerRadius: 9))
-            }
             HStack(alignment: .top) {
                 VStack(alignment: .leading, spacing: 7) { Text("剪贴板").font(.system(size: 24, weight: .semibold)); Text("复制的内容，按来源留在这里。").font(.system(size: 12)).foregroundStyle(NativeTheme.muted) }
                 Spacer(); Button { sending = true } label: { Label("发送", systemImage: "square.and.arrow.up") }.buttonStyle(.borderedProminent).disabled(model.snapshot.clipboardContext.isEmpty)

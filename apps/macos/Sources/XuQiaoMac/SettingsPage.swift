@@ -35,6 +35,24 @@ struct SettingsPage: View {
                 Divider().padding(.leading, 52)
                 preferenceRow("自动显示图片预览", subtitle: "开启时自动显示小缩略图；图片原图自动保留内部缓存，点击下载后才保存到 Downloads/续桥", symbol: "photo", value: binding(\.previewsEnabled))
             }.disabled(saving || model.snapshot.clipboardContext.isEmpty)
+            section("文件接收") {
+                preferenceRow("接收文件前确认", subtitle: "默认自动接收已配对设备的文件，在“文件传输”查看；开启后弹窗确认。", symbol: "arrow.down.doc", value: $model.confirmIncomingFiles)
+                Divider().padding(.leading, 52)
+                HStack(spacing: 12) {
+                    rowIcon("folder")
+                    VStack(alignment: .leading, spacing: 5) {
+                        Text("接收文件夹").font(.system(size: 13))
+                        Text(model.snapshot.files.receiveFolderPath.map { ($0 as NSString).abbreviatingWithTildeInPath } ?? "请选择接收文件夹")
+                            .font(.system(size: 11)).foregroundStyle(NativeTheme.muted).lineLimit(1).truncationMode(.middle)
+                            .help(model.snapshot.files.receiveFolderPath ?? "").accessibilityIdentifier("receive-folder-path")
+                        Text("文件收完后自动保存；同名文件自动编号。剪贴板缓存单独管理。")
+                            .font(.system(size: 10)).foregroundStyle(NativeTheme.muted)
+                    }
+                    Spacer()
+                    Button("更改…") { model.chooseReceiveFolder() }.disabled(model.choosingReceiveFolder || !model.snapshot.ready)
+                        .accessibilityIdentifier("receive-folder-change")
+                }.padding(.horizontal, 17).padding(.vertical, 13)
+            }
             section("存储与连接") {
                 Button { model.selection = .storage } label: { navigationRow("缓存与存储", symbol: "internaldrive", value: readableBytes(model.snapshot.clipboardCache.bytes + model.snapshot.clipboardCache.previewBytes + model.snapshot.clipboardCache.privateImageBytes)) }.buttonStyle(.plain)
                 Divider().padding(.leading, 52)

@@ -14,7 +14,12 @@ struct MainWindow: View {
                 Text("工作空间").font(.system(size: 10, weight: .medium)).foregroundStyle(NativeTheme.muted.opacity(0.8)).padding(.horizontal, 22).padding(.bottom, 10)
                 ForEach(pages) { page in
                     Button { model.selection = page } label: {
-                        HStack(spacing: 11) { Image(systemName: page.symbol).frame(width: 18); Text(page.rawValue); Spacer() }
+                        HStack(spacing: 11) {
+                            Image(systemName: page.symbol).frame(width: 18); Text(page.rawValue); Spacer()
+                            if page == .files, !model.snapshot.files.pendingReceives.isEmpty {
+                                Text("\(model.snapshot.files.pendingReceives.count)").font(.system(size: 10, weight: .medium)).padding(.horizontal, 6).padding(.vertical, 2).background(NativeTheme.blueLight, in: Capsule())
+                            }
+                        }
                             .font(.system(size: 13, weight: active(page) ? .medium : .regular))
                             .foregroundStyle(active(page) ? NativeTheme.blue : NativeTheme.muted)
                             .padding(.horizontal, 13).frame(height: 39)
@@ -63,9 +68,6 @@ struct MainWindow: View {
                         if model.selection != .connection, model.snapshot.pending != nil {
                             HStack { Label("有新的设备配对请求", systemImage: "iphone.and.arrow.forward"); Spacer(); Button("查看并确认") { model.showPairing() }.buttonStyle(.borderedProminent) }.font(.system(size: 12)).padding(14).background(NativeTheme.blueLight, in: RoundedRectangle(cornerRadius: 10))
                         }
-                        if model.selection != .files, model.snapshot.files.tasks.contains(where: { $0.isFileTransferRecord && $0.state == .awaitingUser }) {
-                            HStack { Label("有文件待接收", systemImage: "arrow.down.doc"); Spacer(); Button("查看") { model.selection = .files } }.font(.system(size: 12)).padding(12).background(NativeTheme.blueLight, in: RoundedRectangle(cornerRadius: 9))
-                        }
                         switch model.selection {
                         case .connection: OverviewPage()
                         case .files: EmptyView()
@@ -80,6 +82,9 @@ struct MainWindow: View {
             }.frame(maxWidth: .infinity)
         }.foregroundStyle(NativeTheme.ink).tint(NativeTheme.blue)
             .sheet(item: $model.sendFilesPeer) { peer in SendFilesSheet(peer: peer).environmentObject(model) }
+            .sheet(item: $model.fileReceivePrompt, onDismiss: { model.fileReceiveSheetDidDismiss() }) { prompt in
+                IncomingFileSheet(prompt: prompt).environmentObject(model).onAppear { model.fileReceiveSheetDidAppear() }
+            }
             // 配对面板由稳定的主窗口持有，不依附概览的滚动内容或自适应布局分支。
             .sheet(isPresented: $model.pairingExpanded, onDismiss: { model.pairingSheetDidDismiss() }) {
                 PairingSheet().environmentObject(model).onAppear { model.pairingSheetDidAppear() }

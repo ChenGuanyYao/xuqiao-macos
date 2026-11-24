@@ -3,11 +3,12 @@ import CoreFoundation
 
 public enum FileTaskDirection: String, Codable { case outgoing, incoming }
 public enum FileTaskState: String, Codable {
-    case waitingConnection, waitingAcceptance, awaitingUser, awaitingData, transferring, verifying, committing
+    case queued, waitingConnection, waitingAcceptance, awaitingUser, awaitingData, transferring, verifying, committing
     case completed, failed, cancelled, rejected, interrupted
     public var terminal: Bool { [.completed, .failed, .cancelled, .rejected, .interrupted].contains(self) }
     public var title: String {
         switch self {
+        case .queued: "排队中"
         case .waitingConnection: "等待连接"
         case .waitingAcceptance: "等待对方接收"
         case .awaitingUser: "等待接收确认"
@@ -52,15 +53,27 @@ public struct FileTaskView: Identifiable, Codable {
     public var totalBytes: Int64?
     public var roots: [String] = []
     public var entries: [GroupEntry] = []
+    public var receivedSaveState: String?
+    public var receivedSaveError: String?
+    public var isOrdinaryReceivedFile: Bool { direction == .incoming && clipboardRecordId == nil && mediaRequestId == nil }
 }
 public struct FileTransferSnapshot {
     public var noticeRevision: UInt64 = 0
     public var tasks: [FileTaskView] = []
+    /// 仅普通文件的当前确认请求，界面无需为接收事件扫描完整历史。
+    public var pendingReceives: [FileTaskView] = []
     public var preparingPeerIds: [String] = []
     public var error: String?
     public var preparations: [FilePreparationView] = []
     public var batchExport: BatchExportView?
+    public var receiveFolderPath: String?
     public init() {}
+    /// 正在传输和剪贴板缓存不占用选择入口；仅当前前台准备防重，并为普通未结束任务设总上限。
+    public func canPrepareSend(peerID: String, excludingTaskID: String? = nil) -> Bool {
+        !preparingPeerIds.contains(peerID) && tasks.filter {
+            $0.peerId == peerID && $0.id != excludingTaskID && $0.clipboardRecordId == nil && !$0.state.terminal
+        }.count < FILE_PENDING_LIMIT
+    }
 }
 struct FileTask: Codable {
     var id: String
@@ -80,11 +93,15 @@ struct FileTask: Codable {
     var clipboard: ClipboardBinding? = nil
     var media: MediaBinding? = nil
     var imagePreview: FileOfferImagePreview? = nil
+    var receivedSave: ReceivedFileSaveReceipt? = nil
+    var ordinaryIncoming: Bool { direction == .incoming && clipboard == nil && media == nil }
     var view: FileTaskView {
         var value = FileTaskView(id: id, peerId: peerId, direction: direction, name: name, size: size, sha256: sha256,
                                  state: state, progress: progress, attemptId: attemptId, error: error)
         value.mediaRequestId = media?.requestId
         value.imagePreview = imagePreview
+        value.receivedSaveState = receivedSave?.state.rawValue
+        value.receivedSaveError = receivedSave?.error
         if let clipboard { value.clipboardRecordId = clipboard.recordId; value.clipboardSourceDeviceId = clipboard.sourceDeviceId; value.clipboardRequestId = clipboard.downloadRequestId; value.clipboardPrivateOnly = clipboard.privateOnly == true }
         if let group {
             value.kind = "group"; value.groupHash = group.groupHash; value.entryCount = group.entryCount

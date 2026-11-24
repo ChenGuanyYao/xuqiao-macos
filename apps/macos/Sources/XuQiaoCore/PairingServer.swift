@@ -444,6 +444,16 @@ public final class PairingServer {
     }
     public func cancelExport(exportID: String) { queue.async { self.fileEngine?.cancelExport(exportID) } }
     public func acceptFile(taskID: String, expectedAttempt: String) { queue.async { self.fileEngine?.accept(taskID, expectedAttempt: expectedAttempt) } }
+    /// 自动接收和弹窗都冻结来源信任域与当前控制连接；旧窗口不能操作新会话。
+    public func respondToFileOffer(taskID: String, expectedAttempt: String, peerID: String, expectedGeneration: String, accept: Bool) {
+        queue.async {
+            guard let peer = self.peers.first(where: { $0.id == peerID }), !peer.paused,
+                  (peer.clipboardTrustGeneration ?? "legacy") == expectedGeneration else { return }
+            let controls = self.channels.values.filter { $0.authenticatedPeer == peerID && !$0.closing && !$0.isFileData && !$0.isMediaData && $0.fileCapable }
+            guard controls.count == 1, let control = controls.first else { return }
+            self.fileEngine?.respondToOffer(taskID, expectedAttempt: expectedAttempt, peer: peerID, control: control.id, accept: accept)
+        }
+    }
     public func rejectFile(taskID: String, expectedAttempt: String) { queue.async { self.fileEngine?.reject(taskID, expectedAttempt: expectedAttempt) } }
     public func cancelFile(taskID: String, expectedAttempt: String) { queue.async { self.fileEngine?.cancel(taskID, expectedAttempt: expectedAttempt) } }
     public func retryFile(taskID: String, expectedAttempt: String) { queue.async { self.fileEngine?.retry(taskID, expectedAttempt: expectedAttempt) } }
@@ -451,6 +461,21 @@ public final class PairingServer {
         queue.async {
             guard let engine = self.fileEngine else { DispatchQueue.main.async { completion("文件存储尚未就绪") }; return }
             engine.export(id: taskID, expectedAttempt: expectedAttempt, destination: destination, replace: replace) { error in DispatchQueue.main.async { completion(error) } }
+        }
+    }
+    public func setReceiveFolder(_ url: URL, completion: @escaping (String?) -> Void) {
+        queue.async {
+            guard let engine = self.fileEngine else { DispatchQueue.main.async { completion("文件服务尚未就绪") }; return }
+            engine.setReceiveFolder(url) { error in DispatchQueue.main.async { completion(error) } }
+        }
+    }
+    public func retryReceivedSave(taskID: String, expectedAttempt: String) {
+        queue.async { self.fileEngine?.retryReceivedSave(taskID, expectedAttempt: expectedAttempt) }
+    }
+    public func locateReceivedFiles(taskID: String, expectedAttempt: String, completion: @escaping ([URL]?, String?) -> Void) {
+        queue.async {
+            guard let engine = self.fileEngine else { DispatchQueue.main.async { completion(nil, "文件服务尚未就绪") }; return }
+            engine.receivedLocations(taskID, expectedAttempt: expectedAttempt) { urls, error in DispatchQueue.main.async { completion(urls, error) } }
         }
     }
     public func locateFile(taskID: String, expectedAttempt: String, completion: @escaping (URL?) -> Void) {
