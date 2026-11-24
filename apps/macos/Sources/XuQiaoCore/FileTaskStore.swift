@@ -32,6 +32,7 @@ final class FileTaskStore {
         if !columns.contains("mediajson") { try exec("ALTER TABLE file_tasks ADD COLUMN mediaJSON TEXT NOT NULL DEFAULT ''") }
         if !columns.contains("groupjson") { try exec("ALTER TABLE file_tasks ADD COLUMN groupJSON TEXT") }
         if !columns.contains("imagepreviewjson") { try exec("ALTER TABLE file_tasks ADD COLUMN imagePreviewJSON TEXT") }
+        if !columns.contains("receivedsavejson") { try exec("ALTER TABLE file_tasks ADD COLUMN receivedSaveJSON TEXT") }
         try? FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: url.path)
         } catch { sqlite3_close(database); database = nil; throw error }
     }
@@ -41,7 +42,7 @@ final class FileTaskStore {
     }
     func all() throws -> [FileTask] {
         var statement: OpaquePointer?
-        guard sqlite3_prepare_v2(database, "SELECT id,peerId,direction,name,size,sha256,sourcePath,destinationPath,state,progress,attemptId,updatedAt,error,groupJSON,clipboardJSON,mediaJSON,imagePreviewJSON FROM file_tasks", -1, &statement, nil) == SQLITE_OK else { throw FileFailure.io }
+        guard sqlite3_prepare_v2(database, "SELECT id,peerId,direction,name,size,sha256,sourcePath,destinationPath,state,progress,attemptId,updatedAt,error,groupJSON,clipboardJSON,mediaJSON,imagePreviewJSON,receivedSaveJSON FROM file_tasks", -1, &statement, nil) == SQLITE_OK else { throw FileFailure.io }
         defer { sqlite3_finalize(statement) }
         func text(_ column: Int32) -> String {
             guard let raw = sqlite3_column_text(statement, column) else { return "" }; return String(cString: raw)
@@ -79,6 +80,12 @@ final class FileTaskStore {
                     task.imagePreview = FileOfferImagePreview.parse(value)
                 }
             }
+            if !text(17).isEmpty {
+                let data = Data(text(17).utf8); guard data.count <= 131_072 else { throw FileFailure.io }
+                let receipt = try JSONDecoder().decode(ReceivedFileSaveReceipt.self, from: data)
+                guard task.ordinaryIncoming, receipt.valid, receipt.attempt == task.attemptId else { throw FileFailure.io }
+                task.receivedSave = receipt
+            }
             rows.append(task)
         }
     }
@@ -95,7 +102,7 @@ final class FileTaskStore {
     }
     private func saveRow(_ task: FileTask) throws {
         var statement: OpaquePointer?
-        let sql = "INSERT OR REPLACE INTO file_tasks(id,peerId,direction,name,size,sha256,sourcePath,destinationPath,state,progress,attemptId,updatedAt,error,groupJSON,clipboardJSON,mediaJSON,imagePreviewJSON) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)"
+        let sql = "INSERT OR REPLACE INTO file_tasks(id,peerId,direction,name,size,sha256,sourcePath,destinationPath,state,progress,attemptId,updatedAt,error,groupJSON,clipboardJSON,mediaJSON,imagePreviewJSON,receivedSaveJSON) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)"
         guard sqlite3_prepare_v2(database, sql, -1, &statement, nil) == SQLITE_OK else { throw FileFailure.io }
         defer { sqlite3_finalize(statement) }
         func text(_ position: Int32, _ value: String) { _ = sqlite3_bind_text(statement, position, value, -1, transient) }
@@ -115,6 +122,11 @@ final class FileTaskStore {
         if let media = task.media { text(16,String(decoding:try JSONEncoder().encode(media),as:UTF8.self)) } else {text(16,"")}
         if let preview = task.imagePreview { text(17, String(decoding: try JSONSerialization.data(withJSONObject: preview.wireFields, options: [.sortedKeys, .withoutEscapingSlashes]), as: UTF8.self)) }
         else { sqlite3_bind_null(statement, 17) }
+        if let receipt = task.receivedSave {
+            guard task.ordinaryIncoming, receipt.valid, receipt.attempt == task.attemptId else { throw FileFailure.io }
+            let data = try JSONEncoder().encode(receipt); guard data.count <= 131_072 else { throw FileFailure.io }
+            text(18, String(decoding: data, as: UTF8.self))
+        } else { sqlite3_bind_null(statement, 18) }
         guard sqlite3_step(statement) == SQLITE_DONE else { throw FileFailure.io }
     }
     /// 只记录已完整校验并同步的公共成品；清理原图时还需重新校验文件，不能仅凭历史成功标记。

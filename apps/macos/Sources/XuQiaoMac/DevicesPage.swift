@@ -152,7 +152,7 @@ struct DevicesPage: View {
         collapsedData = (try? JSONEncoder().encode(Array(closed).sorted())) ?? Data()
         expandedData = (try? JSONEncoder().encode(Array(opened).sorted())) ?? Data()
     }
-    private func busy(_ peer: PeerView) -> Bool { model.snapshot.files.preparingPeerIds.contains(peer.id) || model.snapshot.files.tasks.contains { $0.peerId == peer.id && !$0.state.terminal } }
+    private func busy(_ peer: PeerView) -> Bool { !model.canChooseFile(peerID: peer.id) }
     private func syncTitle(_ peer: PeerView) -> String {
         guard model.snapshot.clipboardPreferences.enabled else { return "本机自动同步已关闭" }
         if let value = model.snapshot.clipboardPeers.first(where: { $0.id == peer.id }), value.capable && !value.remoteAccept { return "手机当前暂停接收" }
@@ -165,12 +165,12 @@ struct SendFilesSheet: View {
     @Environment(\.dismiss) private var dismiss
     let peer: PeerView
     private var current: PeerView? { model.snapshot.peers.first { $0.id == peer.id && $0.trustGeneration == peer.trustGeneration } }
-    private var busy: Bool { model.snapshot.files.preparingPeerIds.contains(peer.id) || model.snapshot.files.tasks.contains { $0.peerId == peer.id && !$0.state.terminal } }
+    private var busy: Bool { !model.canChooseFile(peerID: peer.id) }
     var body: some View {
         VStack(alignment: .leading, spacing: 21) {
             HStack { Text("发送文件").font(.system(size: 20, weight: .semibold)); Spacer(); Button("取消") { dismiss() } }
             HStack(spacing: 12) { Image(systemName: "iphone").font(.system(size: 27, weight: .light)).foregroundStyle(NativeTheme.blue); VStack(alignment: .leading, spacing: 5) { Text(deviceLabel(peer.name, id: peer.id)).font(.system(size: 14, weight: .medium)); Text(current?.connected == true ? "仅发送到这台设备" : "设备未连接").font(.system(size: 12)).foregroundStyle(NativeTheme.muted) } }.padding(16).frame(maxWidth: .infinity, alignment: .leading).background(NativeTheme.blueLight, in: RoundedRectangle(cornerRadius: 11))
-            Text(busy ? "这台设备正在传输，完成后可继续发送。" : current?.groupCapable == true ? "选择文件或文件夹，最多 100 个顶层项目。对方确认后开始传输。" : "选择一份文件。对方确认后开始传输。").font(.system(size: 12)).foregroundStyle(NativeTheme.muted)
+            Text(busy ? "正在选择或准备文件，或该设备普通任务已达50项。" : current?.groupCapable == true ? "选择文件或文件夹，最多 100 个顶层项目。对方确认后开始传输，通道占满时自动排队。" : "选择一份文件。对方确认后开始传输，通道占满时自动排队。").font(.system(size: 12)).foregroundStyle(NativeTheme.muted)
             HStack { Spacer(); Button("选择文件…") { guard let current, current.connected else { return }; dismiss(); model.chooseFile(peerID: peer.id, allowGroups: current.groupCapable, expectedGeneration: peer.trustGeneration) }.buttonStyle(.borderedProminent).disabled(current?.connected != true || current?.fileCapable != true || busy) }
         }.padding(26).frame(width: 440)
             .onChange(of: model.snapshot.peers.map { $0.id + $0.trustGeneration }) { _, _ in if current == nil { dismiss() } }

@@ -7,6 +7,7 @@ struct BatchTaskOutcome {
     let savedRoots: Int
     let message: String
     var exportedFile: URL? = nil
+    var exportedRoots: [URL] = []
 }
 private struct CreatedExport {
     let components: [String]
@@ -89,6 +90,7 @@ extension FileStorage {
     func exportReceivedTask(_ task: FileTask, applicationDirectory: URL, cancellation: WorkCancellation) -> BatchTaskOutcome {
         var saved = 0
         var exportedFile: URL?
+        var exportedRoots: [URL] = []
         var created: [CreatedExport] = []
         var base: Int32 = -1
         defer { if base >= 0 { close(base) } }
@@ -154,15 +156,16 @@ extension FileStorage {
                 guard fsync(base) == 0 else { throw FileFailure.io }
                 // 只有当前root全部校验/同步后才保留；后续失败不回滚这些已保存内容。
                 saved += 1; created = []
+                exportedRoots.append(applicationDirectory.appendingPathComponent(name, isDirectory: rootEntry.isDirectory))
                 if task.group == nil { exportedFile = applicationDirectory.appendingPathComponent(name) }
             }
-            return BatchTaskOutcome(state: "completed", savedRoots: saved, message: "已保存全部\(saved)个顶层项目", exportedFile: exportedFile)
+            return BatchTaskOutcome(state: "completed", savedRoots: saved, message: "已保存全部\(saved)个顶层项目", exportedFile: exportedFile, exportedRoots: exportedRoots)
         } catch {
             if base >= 0 { cleanCreated(created, base: base); _ = fsync(base) }
             let cancelled = error is WorkCancelled
             let detail = cancelled ? "保存已取消" : ((error as? FileFailure)?.localizedDescription ?? FileFailure.io.localizedDescription)
             return BatchTaskOutcome(state: cancelled ? "cancelled" : "failed", savedRoots: saved,
-                                    message: saved > 0 ? "部分已保存（\(saved)个顶层项目）；" + detail : detail)
+                                    message: saved > 0 ? "部分已保存（\(saved)个顶层项目）；" + detail : detail, exportedRoots: exportedRoots)
         }
     }
     #if DEBUG

@@ -38,7 +38,6 @@ final class BluetoothWakeCoordinator: NSObject, CBCentralManagerDelegate, CBPeri
     private var retryDelay: Double = 1
     private var active = false
     private var epoch = UUID()
-    private static let permissionRequestedKey = "bluetoothWake.permissionRequested.v1"
     private(set) var status = "蓝牙辅助未启用"
     static var currentAuthorization: BluetoothWakeAuthorization { authorization(CBManager.authorization) }
     var authorization: BluetoothWakeAuthorization { Self.currentAuthorization }
@@ -72,29 +71,26 @@ final class BluetoothWakeCoordinator: NSObject, CBCentralManagerDelegate, CBPeri
         if targets.isEmpty { stopConnections() }
         refreshAuthorization()
     }
-    /// 静态授权查询不分配 manager；拒绝、受限及已询问未决定均不在启动时再次申请。
+    /// 以系统当前授权为准；更新签名后可能回到未决定，不能被旧申请标记永久挡住。
     func refreshAuthorization() {
         dispatchPrecondition(condition: .onQueue(queue))
         guard active else { return }
-        if central == nil, Self.shouldCreateManager(authorization: authorization, hasTargets: !targets.isEmpty,
-            requested: UserDefaults.standard.bool(forKey: Self.permissionRequestedKey), manual: false) { createManager() }
+        if central == nil, Self.shouldCreateManager(authorization: authorization, hasTargets: !targets.isEmpty, manual: false) { createManager() }
         updateAvailability()
     }
     /// 返回 true 时由界面打开公开的系统设置入口，不尝试重置 TCC。
     func requestAuthorization() -> Bool {
         dispatchPrecondition(condition: .onQueue(queue))
         guard active else { return false }
-        if central == nil, Self.shouldCreateManager(authorization: authorization, hasTargets: !targets.isEmpty,
-            requested: UserDefaults.standard.bool(forKey: Self.permissionRequestedKey), manual: true) {
+        if central == nil, Self.shouldCreateManager(authorization: authorization, hasTargets: !targets.isEmpty, manual: true) {
             createManager(); updateAvailability(); return false
         }
         return true
     }
-    static func shouldCreateManager(authorization: BluetoothWakeAuthorization, hasTargets: Bool, requested: Bool, manual: Bool) -> Bool {
-        authorization == .allowed || (authorization == .notDetermined && (manual || (hasTargets && !requested)))
+    static func shouldCreateManager(authorization: BluetoothWakeAuthorization, hasTargets: Bool, manual: Bool) -> Bool {
+        authorization == .allowed || (authorization == .notDetermined && (manual || hasTargets))
     }
     private func createManager() {
-        if authorization == .notDetermined { UserDefaults.standard.set(true, forKey: Self.permissionRequestedKey) }
         central = CBCentralManager(delegate: self, queue: queue, options: [CBCentralManagerOptionShowPowerAlertKey: false])
     }
     static func authorization(_ value: CBManagerAuthorization) -> BluetoothWakeAuthorization {

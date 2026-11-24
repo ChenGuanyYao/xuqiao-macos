@@ -4,6 +4,7 @@ import SwiftUI
 import XuQiaoCore
 
 enum DesktopPreferences {
+    static let confirmIncomingFilesKey = "files.confirmIncoming"
     static let keepRunningInMenuBarKey = "app.keepRunningInMenuBar"
     static var keepRunningInMenuBar: Bool {
         UserDefaults.standard.object(forKey: keepRunningInMenuBarKey) as? Bool ?? true
@@ -18,6 +19,8 @@ final class DesktopLifecycle: NSObject {
     private var windowDelegate: MainWindowCloseDelegate?
     private var statusItem: NSStatusItem?
     private var snapshotSubscription: AnyCancellable?
+    private var filePromptSubscription: AnyCancellable?
+    private var sheetSubscription: AnyCancellable?
     private var pendingRequestID: String?
     private var openMainWindow: (() -> Void)?
     var terminating = false
@@ -27,6 +30,12 @@ final class DesktopLifecycle: NSObject {
         if self.model !== model {
             self.model = model
             installStatusItem()
+            filePromptSubscription = model.$fileReceivePrompt.map { $0?.id }.removeDuplicates().sink { [weak self] id in
+                if id != nil { self?.show() }
+            }
+            sheetSubscription = NotificationCenter.default.publisher(for: NSWindow.didEndSheetNotification).sink { [weak model] _ in
+                DispatchQueue.main.async { model?.refreshFileReception() }
+            }
             snapshotSubscription = model.$snapshot.sink { [weak self] snapshot in
                 guard let self else { return }
                 self.refreshStatus(snapshot)

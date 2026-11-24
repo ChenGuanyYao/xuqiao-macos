@@ -81,7 +81,71 @@ final class AppModel: ObservableObject {
     private var lastCoreClipboardNoticeID: UUID?
     @Published var transferOperationNotice: String? { didSet { transferOperationNoticeID = UUID() } }
     @Published private(set) var transferOperationNoticeID = UUID()
+    @Published private(set) var hiddenBatchExportID: String?
+    private var batchExportFeedbackKey: String?
+    private var batchExportFeedbackTask: Task<Void, Never>?
+    private func updateBatchExportFeedback(_ status: BatchExportView?) {
+        let key = status.map { $0.id + "|" + $0.state }
+        guard key != batchExportFeedbackKey else { return }
+        batchExportFeedbackKey = key
+        batchExportFeedbackTask?.cancel()
+        guard let status, batchExportSucceeded(status) else { return }
+        let id = status.id
+        // 只隐藏界面反馈，保留Core回执；切页和重复快照不重启倒计时。
+        batchExportFeedbackTask = Task { [weak self] in
+            try? await Task.sleep(for: .seconds(5))
+            guard !Task.isCancelled, let self,
+                  let current = self.snapshot.files.batchExport,
+                  current.id == id, batchExportSucceeded(current) else { return }
+            self.hiddenBatchExportID = id
+        }
+    }
+    func dismissBatchExport(_ id: String) {
+        guard let current = snapshot.files.batchExport, current.id == id, current.state != "exporting" else { return }
+        batchExportFeedbackTask?.cancel()
+        hiddenBatchExportID = id
+    }
     private var receivedOperationSnapshot = false
+    @Published var confirmIncomingFiles = UserDefaults.standard.bool(forKey: DesktopPreferences.confirmIncomingFilesKey) {
+        didSet {
+            UserDefaults.standard.set(confirmIncomingFiles, forKey: DesktopPreferences.confirmIncomingFilesKey)
+            if confirmIncomingFiles != oldValue { handledFileOffers.removeAll(); refreshFileReception() }
+        }
+    }
+    @Published var fileReceivePrompt: IncomingFilePrompt?
+    private var fileReceiveSheetPresented = false
+    private var handledFileOffers = Set<String>()
+    func fileReceiveSheetDidAppear() { fileReceiveSheetPresented = true }
+    func fileReceiveSheetDidDismiss() { fileReceiveSheetPresented = false; refreshFileReception() }
+    func refreshFileReception() {
+        let requests = snapshot.files.pendingReceives.compactMap { task -> IncomingFilePrompt? in
+            guard task.isFileTransferRecord, task.direction == .incoming, task.state == .awaitingUser, task.mediaRequestId == nil,
+                  let peer = snapshot.peers.first(where: { $0.id == task.peerId && $0.connected && $0.fileCapable && (task.kind != "group" || $0.groupCapable) && !$0.paused && !$0.trustGeneration.isEmpty }) else { return nil }
+            return IncomingFilePrompt(task: task, peer: peer)
+        }
+        let currentKeys = Set(requests.map(\.id))
+        handledFileOffers.formIntersection(currentKeys)
+        if let prompt = fileReceivePrompt, !confirmIncomingFiles || !currentKeys.contains(prompt.id) { fileReceivePrompt = nil }
+        if !confirmIncomingFiles {
+            for request in requests where !handledFileOffers.contains(request.id) {
+                handledFileOffers.insert(request.id)
+                respondToFileOffer(request, accept: true)
+            }
+            return
+        }
+        // 结果由服务事件推进；不轮询历史，也不抢占配对、文件选择或其它已打开的sheet。
+        guard fileReceivePrompt == nil, !fileReceiveSheetPresented, pairingPrompt == nil, !pairingExpanded,
+              !pairingSheetPresented, sendFilesPeer == nil, !NSApp.windows.contains(where: { $0.isSheet && $0.isVisible }),
+              let request = requests.first(where: { !handledFileOffers.contains($0.id) }) else { return }
+        handledFileOffers.insert(request.id)
+        fileReceivePrompt = request
+    }
+    func respondToFileOffer(_ prompt: IncomingFilePrompt, accept: Bool) {
+        guard snapshot.files.pendingReceives.contains(where: { $0.id == prompt.task.id && $0.attemptId == prompt.task.attemptId && $0.peerId == prompt.peer.id }),
+              snapshot.peers.contains(where: { $0.id == prompt.peer.id && $0.trustGeneration == prompt.peer.trustGeneration && $0.connected && !$0.paused }) else { fileReceivePrompt = nil; return }
+        server.respondToFileOffer(taskID: prompt.task.id, expectedAttempt: prompt.task.attemptId, peerID: prompt.peer.id, expectedGeneration: prompt.peer.trustGeneration, accept: accept)
+        if fileReceivePrompt?.id == prompt.id { fileReceivePrompt = nil }
+    }
     @Published var clipboardSource = UserDefaults.standard.string(forKey: "clipboard.source") ?? ""
     @Published var clipboardSourceName = ""
     @Published var filePeer = UserDefaults.standard.string(forKey: "files.peer") ?? ""
@@ -206,32 +270,62 @@ final class AppModel: ObservableObject {
                 self.transferOperationNotice = snapshot.files.error
             }
             self.receivedOperationSnapshot = true
+            self.updateBatchExportFeedback(snapshot.files.batchExport)
             self.snapshot=snapshot
             self.debugControlService?.updatePeers(snapshot.peers)
             // 面板仍在退出动画中时暂不登记已提示；onDismiss 按届时当前请求重新核对。
             // A 取消后 B 在动画期间到来，也只会展示 B，取消/过期请求不会复活。
             self.presentPairingPromptIfNeeded()
+            self.refreshFileReception()
         }
+    }
+    @Published private(set) var choosingFile = false
+    @Published private var pendingFilePreparations = Set<String>()
+    func canChooseFile(peerID: String) -> Bool {
+        !choosingFile && !pendingFilePreparations.contains(peerID) && snapshot.files.canPrepareSend(peerID: peerID)
     }
     func chooseFile(peerID: String, allowGroups: Bool = false, expectedGeneration: String) {
         guard snapshot.peers.contains(where: { $0.id == peerID && $0.trustGeneration == expectedGeneration }) else { fileNotice = "设备信任已更新，请重新选择"; return }
-        guard !snapshot.files.preparingPeerIds.contains(peerID), !snapshot.files.tasks.contains(where: { $0.peerId == peerID && !$0.state.terminal }) else { fileNotice = "这台设备正在传输，请稍后再发送"; return }
+        guard canChooseFile(peerID: peerID) else { fileNotice = "正在选择或准备文件，或普通任务已达50项"; return }
+        choosingFile = true
         let panel = NSOpenPanel(); panel.title = allowGroups ? "选择文件或文件夹（最多100项）" : "选择要发送的文件"
         panel.canChooseFiles = true; panel.canChooseDirectories = allowGroups; panel.allowsMultipleSelection = allowGroups; panel.resolvesAliases = false
         panel.begin { [weak self] response in
-            guard response == .OK, !panel.urls.isEmpty, let self else { return }
+            guard let self else { return }
+            self.choosingFile = false
+            guard response == .OK, !panel.urls.isEmpty else { return }
             // 文件面板打开期间设备可能被移除并重新配对，旧窗口不能沿用新的授权。
             guard self.snapshot.peers.contains(where: { $0.id == peerID && $0.trustGeneration == expectedGeneration }) else { self.fileNotice = "设备信任已更新，请重新选择"; return }
-            guard !self.snapshot.files.preparingPeerIds.contains(peerID), !self.snapshot.files.tasks.contains(where: { $0.peerId == peerID && !$0.state.terminal }) else { self.fileNotice = "这台设备正在传输，请稍后再发送"; return }
+            guard self.canChooseFile(peerID: peerID) else { self.fileNotice = "正在准备文件，或普通任务已达50项"; return }
             let urls = panel.urls
             guard urls.count <= 100 else { self.fileNotice = "最多选择100个顶层项目"; return }
             let scoped = urls.filter { $0.startAccessingSecurityScopedResource() }
-            self.fileNotice = nil
+            self.fileNotice = nil; self.pendingFilePreparations.insert(peerID)
             let finish: (String?) -> Void = { [weak self] error in
-                for url in scoped { url.stopAccessingSecurityScopedResource() }; self?.fileNotice = error
+                for url in scoped { url.stopAccessingSecurityScopedResource() }
+                self?.pendingFilePreparations.remove(peerID); self?.fileNotice = error
             }
             if allowGroups { self.server.sendMany(sources: urls, peerID: peerID, expectedGeneration: expectedGeneration, completion: finish) }
             else if let url = urls.first { self.server.sendFile(source: url, peerID: peerID, expectedGeneration: expectedGeneration, completion: finish) }
+        }
+    }
+    @Published private(set) var choosingReceiveFolder = false
+    func chooseReceiveFolder() {
+        guard !choosingReceiveFolder else { return }
+        choosingReceiveFolder = true
+        let panel = NSOpenPanel(); panel.title = "选择接收文件夹"; panel.prompt = "使用这个文件夹"
+        panel.canChooseFiles = false; panel.canChooseDirectories = true; panel.allowsMultipleSelection = false
+        panel.canCreateDirectories = true; panel.resolvesAliases = false
+        if let path = snapshot.files.receiveFolderPath { panel.directoryURL = URL(fileURLWithPath: path, isDirectory: true) }
+        panel.begin { [weak self] response in
+            guard let self else { return }
+            guard response == .OK, let url = panel.url else { self.choosingReceiveFolder = false; return }
+            let scoped = url.startAccessingSecurityScopedResource()
+            self.server.setReceiveFolder(url) { [weak self] error in
+                if scoped { url.stopAccessingSecurityScopedResource() }
+                self?.choosingReceiveFolder = false
+                if let error { self?.transferOperationNotice = error }
+            }
         }
     }
     func saveMany(_ selections: [FileTaskSelection]) {
@@ -258,12 +352,28 @@ final class AppModel: ObservableObject {
         }
     }
     func openFile(_ task: FileTaskView) {
+        if task.isOrdinaryReceivedFile {
+            server.locateReceivedFiles(taskID: task.id, expectedAttempt: task.attemptId) { [weak self] urls, error in
+                guard let urls, let first = urls.first else { self?.transferOperationNotice = error ?? "本地文件已不存在"; return }
+                // 多root共用本次接收目录；Finder操作则会一次选中全部root。
+                let target = urls.count == 1 ? first : first.deletingLastPathComponent()
+                if !NSWorkspace.shared.open(target) { self?.transferOperationNotice = "无法打开此文件，请在 Finder 中选择合适的应用" }
+            }
+            return
+        }
         server.locateFile(taskID: task.id, expectedAttempt: task.attemptId) { [weak self] url in
             guard let url else { self?.fileNotice = "本地文件已不存在或校验未通过，请重新下载"; return }
             if !NSWorkspace.shared.open(url) { self?.fileNotice = "无法打开此文件，请在 Finder 中选择合适的应用" }
         }
     }
     func reveal(_ task: FileTaskView) {
+        if task.isOrdinaryReceivedFile {
+            server.locateReceivedFiles(taskID: task.id, expectedAttempt: task.attemptId) { [weak self] urls, error in
+                if let urls, !urls.isEmpty { NSWorkspace.shared.activateFileViewerSelecting(urls) }
+                else { self?.transferOperationNotice = error ?? "本地文件已不存在" }
+            }
+            return
+        }
         server.locateFile(taskID: task.id, expectedAttempt: task.attemptId) { [weak self] url in
             if let url {
                 if task.kind == "group" { NSWorkspace.shared.open(url) }

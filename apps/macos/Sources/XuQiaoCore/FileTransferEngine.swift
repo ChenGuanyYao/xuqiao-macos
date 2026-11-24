@@ -10,7 +10,7 @@ private struct PendingFileExport {
     let mediaAuthorization: MediaBinding?
     let completion: () -> Void
 }
-private struct FilePeerSession { let control: UUID; let groupCapable: Bool }
+private struct FilePeerSession { let control: UUID; let groupCapable: Bool; let limits: FileConcurrencyLimits }
 private final class FileDataJob {
     let channel: UUID
     let control: UUID
@@ -30,7 +30,9 @@ private final class FileDataJob {
 /// 控制心跳在 PairingServer 队列，文件状态/SQLite/分块写入在本队列，长复制/完整哈希另用 IO 队列。
 final class FileTransferEngine {
     private let queue = DispatchQueue(label: "com.chenguangyao.xuqiao.files")
-    private let io = DispatchQueue(label: "com.chenguangyao.xuqiao.files.prepare", qos: .utility)
+    private let io = DispatchQueue(label: "com.chenguangyao.xuqiao.files.io", qos: .utility)
+    private let preparationIO = DispatchQueue(label: "com.chenguangyao.xuqiao.files.prepare", qos: .userInitiated)
+    private let clipboardPreparationIO = DispatchQueue(label: "com.chenguangyao.xuqiao.files.clipboard", qos: .utility)
     private let storage: FileStorage
     private let database: FileTaskStore
     private let clipboardRecords: ClipboardRecordStore
@@ -42,11 +44,20 @@ final class FileTransferEngine {
     private var privateCacheSizes: [String: Int64] = [:]
     private var clearedPrivateImages = Set<String>()
     private var singleExports = Set<String>()
+    private let automaticSavingEnabled: Bool
+    private var receiveFolder: ReceiveFolderLocation?
+    private var receivedSaveQueue: [String] = []
+    private var receivedSaveRunning = false
     private var exportingIDs = Set<String>()
     private var sessions: [String: FilePeerSession] = [:]
     private var jobs: [UUID: FileDataJob] = [:]
     private var deadlines: [String: Date] = [:]
     private var preparing: [String: String] = [:]
+    private var clipboardPreparing: [String: String] = [:]
+    private var pendingScheduling = Set<String>()
+    private var busyRetryCounts: [String: Int] = [:]
+    private var busyRetryWork: [String: DispatchWorkItem] = [:]
+    private let busyRetryDelays: [TimeInterval]
     private var preparationTokens: [String: WorkCancellation] = [:]
     private var exportView: BatchExportView?
     private var exportCancellation: WorkCancellation?
@@ -67,7 +78,11 @@ final class FileTransferEngine {
 
     init(configuration: ServerConfiguration, send: @escaping (UUID, [String: Any], Bool) -> Void,
          close: @escaping (UUID) -> Void, resume: @escaping (UUID) -> Void,
-         changed: @escaping (FileTransferSnapshot) -> Void) throws {
+         changed: @escaping (FileTransferSnapshot) -> Void,
+         busyRetryDelays: [TimeInterval] = [2, 4, 8, 16, 30], receiveFolder: ReceiveFolderLocation? = nil) throws {
+        self.busyRetryDelays = busyRetryDelays
+        automaticSavingEnabled = configuration.fileStoreDirectory == nil || receiveFolder != nil
+        self.receiveFolder = receiveFolder ?? (configuration.fileStoreDirectory == nil ? try? ReceiveFolderLocation.load() : nil)
         self.configuration = configuration; self.send = send; closeChannel = close; resumeRead = resume; self.changed = changed
         storage = try FileStorage(directory: configuration.fileStoreDirectory)
         database = try FileTaskStore(url: storage.root.appendingPathComponent("tasks.sqlite3"))
@@ -100,6 +115,11 @@ final class FileTransferEngine {
                     }
                 }
             }
+            // 复制途中崩溃可能已有部分公共文件，不能重启后静默再复制一遍。
+            if var receipt = task.receivedSave, receipt.state == .saving {
+                receipt.state = .failed; receipt.error = "上次保存被中断，请检查接收文件夹后重试"
+                task.receivedSave = receipt; try database.save(task)
+            }
             tasks[task.id] = task
             if task.clipboard != nil && task.direction == .outgoing && task.state.terminal { storage.cleanSource(task) }
         }
@@ -114,11 +134,17 @@ final class FileTransferEngine {
                     self.hideHistory([FileTaskSelection(id: task.id, attemptId: task.attemptId)], completion: { _ in })
                 }
             }
+            for task in Array(self.tasks.values) where task.receivedSave?.state == .pending { self.queueReceivedSave(task) }
             self.emit()
         }
     }
     func registerMediaRequest(_ binding:MediaBinding,control:UUID,name:String,size:Int64,completion:@escaping(Bool)->Void) {
-        queue.async { guard binding.valid,binding.controlId==control.uuidString,self.sessions[binding.peerId]?.control==control,self.active(peer:binding.peerId)==nil,self.preparing[binding.peerId]==nil,!self.mediaRequests.values.contains(where:{$0.0.peerId==binding.peerId}) else {completion(false);return};self.mediaRequests[binding.requestId]=(binding,control,name,size);completion(true) }
+        queue.async {
+            guard binding.valid, binding.controlId == control.uuidString,
+                  self.sessions[binding.peerId]?.control == control,
+                  self.ordinaryTaskCount(peer: binding.peerId) + self.mediaRequests.values.filter({ $0.0.peerId == binding.peerId }).count < FILE_PENDING_LIMIT else { completion(false); return }
+            self.mediaRequests[binding.requestId] = (binding, control, name, size); completion(true)
+        }
     }
     func cancelMediaRequest(_ request:String) { queue.async {self.mediaRequests.removeValue(forKey:request);for task in self.tasks.values where task.media?.requestId==request && !task.state.terminal && task.state != .committing {self.terminate(task,state:.cancelled,text:"共享内容下载请求已取消")}} }
     func cancelMediaRequests(peer:String,control:UUID) {queue.async {self.mediaRequests=self.mediaRequests.filter{$0.value.0.peerId != peer || $0.value.1 != control};for task in self.tasks.values where task.peerId==peer && task.media?.controlId==control.uuidString && !task.state.terminal && task.state != .committing {self.terminate(task,state:.cancelled,text:"共享内容已结束，请重新选择下载")}}}
@@ -178,27 +204,30 @@ final class FileTransferEngine {
     }
     func prepareClipboardSend(peer: String, control: UUID, content: ClipboardContent, binding: ClipboardBinding, snapshot: URL, completion: @escaping (String?) -> Void) {
         queue.async {
-            if let old = self.active(peer: peer), old.clipboard?.recordId == content.recordId, [.waitingConnection, .waitingAcceptance].contains(old.state), !self.jobs.values.contains(where: { $0.taskId == old.id }) {
+            guard self.sessions[peer]?.control == control, self.clipboardTrust[peer] == binding.trustGeneration else { completion("CLIP_STALE"); return }
+            if let old = self.tasks.values.first(where: { $0.peerId == peer && $0.direction == .outgoing && $0.clipboard?.recordId == content.recordId && [.queued, .waitingConnection, .waitingAcceptance].contains($0.state) }) {
                 self.terminate(old, state: .cancelled, text: "新的明确下载请求替换了旧等待任务")
             }
             guard self.sessions[peer]?.control == control, self.clipboardTrust[peer] == binding.trustGeneration,
-                  self.active(peer: peer) == nil, self.preparing[peer] == nil else { completion("CLIP_BUSY"); return }
+                  !self.tasks.values.contains(where: { $0.peerId == peer && $0.direction == .outgoing && $0.clipboard != nil && !$0.state.terminal }),
+                  self.clipboardPreparing[peer] == nil else { completion("CLIP_BUSY"); return }
             let id = UUID().uuidString.lowercased(), cancellation = WorkCancellation()
-            self.preparing[peer] = id; self.preparationTokens[id] = cancellation; self.emit()
-            self.io.async {
+            self.clipboardPreparing[peer] = id; self.preparationTokens[id] = cancellation; self.emit()
+            self.clipboardPreparationIO.async {
                 let result = Result { try self.storage.prepare(snapshot, id: id, cancellation: cancellation) }
                 self.queue.async {
-                    self.preparing.removeValue(forKey: peer); self.preparationTokens.removeValue(forKey: id)
-                    guard self.sessions[peer]?.control == control, self.clipboardTrust[peer] == binding.trustGeneration, !cancellation.isCancelled else {
-                        self.io.async { try? self.storage.removeUnpublishedStage(id) }; completion("CLIP_STALE"); return
+                    let currentPreparation = self.clipboardPreparing[peer] == id
+                    if currentPreparation { self.clipboardPreparing.removeValue(forKey: peer) }; self.preparationTokens.removeValue(forKey: id)
+                    guard currentPreparation, self.sessions[peer]?.control == control, self.clipboardTrust[peer] == binding.trustGeneration, !cancellation.isCancelled else {
+                        self.clipboardPreparationIO.async { try? self.storage.removeUnpublishedStage(id) }; completion("CLIP_STALE"); return
                     }
                     do {
                         let prepared = try result.get(); guard prepared.size == content.size, prepared.hash == content.sha256 else { throw ClipboardFailure.invalid }
                         var task = FileTask(id: id, peerId: peer, direction: .outgoing, name: content.name, size: content.size, sha256: content.sha256,
-                            sourcePath: self.storage.source(id).path, destinationPath: "", state: .waitingConnection, progress: 0, attemptId: UUID().uuidString.lowercased(), updatedAt: Date(), error: nil)
+                            sourcePath: self.storage.source(id).path, destinationPath: "", state: .queued, progress: 0, attemptId: UUID().uuidString.lowercased(), updatedAt: Date(), error: nil)
                         task.group = content.group; task.clipboard = binding
-                        try self.put(task); self.offer(id); completion(nil)
-                    } catch { self.io.async { try? self.storage.removeUnpublishedStage(id) }; completion("CLIP_IO") }
+                        try self.put(task); completion(nil)
+                    } catch { self.clipboardPreparationIO.async { try? self.storage.removeUnpublishedStage(id) }; completion("CLIP_IO") }
                 }
             }
         }
@@ -206,7 +235,7 @@ final class FileTransferEngine {
     func materializeClipboard(content: ClipboardContent, binding: ClipboardBinding, snapshot: URL, permit: ClipboardPermit, completion: @escaping (String?) -> Void) {
         queue.async {
             guard binding.trustGeneration == "self", binding.sourceDeviceId == content.sourceDeviceId,
-                  self.preparing[content.sourceDeviceId] == nil, self.active(peer: content.sourceDeviceId) == nil else { completion("CLIP_BUSY"); return }
+                  self.clipboardPreparing[content.sourceDeviceId] == nil, !self.tasks.values.contains(where: { $0.peerId == content.sourceDeviceId && $0.clipboard != nil && !$0.state.terminal }) else { completion("CLIP_BUSY"); return }
             let id = UUID().uuidString.lowercased(), cancellation = WorkCancellation()
             var task = FileTask(id: id, peerId: content.sourceDeviceId, direction: .incoming, name: content.name, size: content.size, sha256: content.sha256,
                 sourcePath: "", destinationPath: "", state: .verifying, progress: 0, attemptId: UUID().uuidString.lowercased(), updatedAt: Date(), error: nil)
@@ -216,9 +245,9 @@ final class FileTransferEngine {
                 do { try self.put(task); return true } catch { return false }
             }
             guard admitted == true else { completion(admitted == nil ? "CLIP_STALE" : "CLIP_IO"); return }
-            self.preparing[content.sourceDeviceId] = id; self.preparationTokens[id] = cancellation
+            self.clipboardPreparing[content.sourceDeviceId] = id; self.preparationTokens[id] = cancellation
             let captured = task
-            self.io.async {
+            self.clipboardPreparationIO.async {
                 let result = Result { () throws -> GroupMetadata? in
                     try self.storage.ensureReceived(captured); self.storage.cleanPartial(captured)
                     let input = try openRegular(snapshot); defer { close(input) }
@@ -236,13 +265,13 @@ final class FileTransferEngine {
                     return nil
                 }
                 self.queue.async {
-                    self.preparing.removeValue(forKey: content.sourceDeviceId); self.preparationTokens.removeValue(forKey: id)
+                    if self.clipboardPreparing[content.sourceDeviceId] == id { self.clipboardPreparing.removeValue(forKey: content.sourceDeviceId) }; self.preparationTokens.removeValue(forKey: id)
                     guard var current = self.tasks[id], current.state == .verifying, !cancellation.isCancelled else { self.storage.cleanPartial(captured); completion("CLIP_STALE"); return }
                     do {
                         current.group = try result.get(); current.state = .committing; try self.put(current)
                     } catch { self.fail(current, failure: .io); completion("CLIP_IO"); return }
                     let committing = current
-                    self.io.async {
+                    self.clipboardPreparationIO.async {
                         let result = Result { if committing.group != nil { try self.storage.commitGroup(committing) } else { try self.storage.commit(committing) } }
                         self.queue.async {
                             do {
@@ -286,12 +315,12 @@ final class FileTransferEngine {
     }
     private func prepareSources(peer: String, sources: [URL], singleOnly: Bool, completion: @escaping (String?) -> Void) {
         queue.async {
-            guard self.active(peer: peer) == nil, self.preparing[peer] == nil else {
-                self.notice = "FILE_BUSY：该设备已有进行中的任务"; self.emit(); completion(self.notice); return
+            guard self.preparing[peer] == nil, self.ordinaryTaskCount(peer: peer) < FILE_PENDING_LIMIT else {
+                self.notice = "FILE_BUSY：正在准备本次发送，或该设备普通任务已达50项"; self.emit(); completion(self.notice); return
             }
             let id = UUID().uuidString.lowercased(), cancellation = WorkCancellation()
             self.preparing[peer] = id; self.preparationTokens[id] = cancellation; self.notice = nil; self.emit()
-            self.io.async {
+            self.preparationIO.async {
                 let result = Result { () throws -> (PreparedPayload, FileOfferImagePreview?) in
                     let payload: PreparedPayload
                     if singleOnly {
@@ -312,6 +341,7 @@ final class FileTransferEngine {
                         completion("准备已取消"); return
                     }
                     self.preparing.removeValue(forKey: peer)
+                    self.schedulePending(peer: peer)
                     switch result {
                     case .success(let (data, preview)):
                         if data.group != nil, self.sessions[peer]?.groupCapable == false {
@@ -320,14 +350,17 @@ final class FileTransferEngine {
                             self.emit(); completion(self.notice); return
                         }
                         var task = FileTask(id: id, peerId: peer, direction: .outgoing, name: data.name, size: data.size, sha256: data.sha256,
-                                            sourcePath: self.storage.source(id).path, destinationPath: "", state: .waitingConnection,
+                                            sourcePath: self.storage.source(id).path, destinationPath: "", state: self.sessions[peer] == nil ? .waitingConnection : .queued,
                                             progress: 0, attemptId: UUID().uuidString.lowercased(), updatedAt: Date(), error: nil)
                         task.group = data.group; task.imagePreview = preview
-                        do { try self.put(task); if self.sessions[peer] != nil { self.offer(task.id) }; completion(nil) }
+                        do {
+                            guard self.ordinaryTaskCount(peer: peer) < FILE_PENDING_LIMIT else { throw FileFailure(code: "FILE_BUSY", message: "该设备普通任务已达50项") }
+                            try self.put(task); completion(nil)
+                        }
                         catch {
                             // 首次put失败没有发布任务；只回收本次ID，不碰任何已持久任务副本。
                             try? self.storage.removeUnpublishedStage(id)
-                            self.notice = FileFailure.io.localizedDescription; self.emit(); completion(self.notice)
+                            self.notice = self.explain(error); self.emit(); completion(self.notice)
                         }
                     case .failure(let error):
                         self.notice = error is WorkCancelled ? "准备已取消" : self.explain(error)
@@ -342,7 +375,7 @@ final class FileTransferEngine {
         queue.async {
             guard self.preparing[peer] == expected else { return }
             self.preparationTokens[expected]?.cancel(); self.preparing.removeValue(forKey: peer)
-            self.notice = "正在取消准备…"; self.emit()
+            self.notice = "正在取消准备…"; self.schedulePending(peer: peer); self.emit()
         }
     }
     func control(peer: String, channel: UUID, message: [String: Any], completion: @escaping () -> Void) {
@@ -355,19 +388,24 @@ final class FileTransferEngine {
                 }
                 let newSession = self.sessions[peer]?.control != channel
                 let groupCapable = message["groupProtocol"] as? String == "xq-group/1"
-                self.sessions[peer] = FilePeerSession(control: channel, groupCapable: groupCapable)
-                var hello: [String: Any] = ["protocol": "xq-file/1", "maxSize": FILE_MAX_SIZE, "chunkSize": FILE_CHUNK_SIZE]
+                let limits: FileConcurrencyLimits
+                do { limits = try FileConcurrencyLimits(hello: message) }
+                catch { self.error(channel, "FILE_INVALID", "文件并发能力无效"); return }
+                self.sessions[peer] = FilePeerSession(control: channel, groupCapable: groupCapable, limits: limits)
+                var hello: [String: Any] = ["protocol": "xq-file/1", "maxSize": FILE_MAX_SIZE, "chunkSize": FILE_CHUNK_SIZE, "maxConcurrentFiles": 3, "maxConcurrentClipboard": 1]
                 if groupCapable { hello["groupProtocol"] = "xq-group/1"; hello["maxEntries"] = GROUP_MAX_ENTRIES; hello["maxRoots"] = GROUP_MAX_ROOTS }
                 self.send(channel, wire("file.hello", hello), false)
                 // 网络自动重试只在新控制认证+hello发生一次，旧会话不会因数据断流自旋重发。
                 if newSession {
-                    for task in self.tasks.values where task.peerId == peer && task.direction == .outgoing && task.state == .waitingConnection { self.offer(task.id) }
+                    for var task in self.tasks.values where task.peerId == peer && task.direction == .outgoing && task.state == .waitingConnection {
+                        task.state = .queued; try? self.put(task)
+                    }
                 }
-                self.emit(); return
+                self.schedulePending(peer: peer); self.emit(); return
             }
             if type == "file.error", message["taskId"] == nil {
                 if self.sessions[peer]?.control == channel {
-                    self.sessions.removeValue(forKey: peer); self.preparing.removeValue(forKey: peer)
+                    self.sessions.removeValue(forKey: peer); self.cancelPeerPreparations(peer)
                     for task in self.tasks.values where task.peerId == peer && !task.state.terminal && task.state != .committing {
                         self.terminate(task, state: .failed, text: self.remoteError(message))
                     }
@@ -407,7 +445,10 @@ final class FileTransferEngine {
                 self.completeSender(task, message: message)
             case "file.error":
                 guard task.state != .completed, task.state != .committing else { return }
-                self.terminate(task, state: .failed, text: self.remoteError(message))
+                if message["code"] as? String == "FILE_BUSY", task.direction == .outgoing, task.state == .queued { return }
+                if message["code"] as? String == "FILE_BUSY", task.direction == .outgoing, task.state == .waitingAcceptance {
+                    self.retryAfterBusy(task, control: channel)
+                } else { self.terminate(task, state: .failed, text: self.remoteError(message)) }
             default:
                 self.fail(task, failure: FileFailure(code: "FILE_INVALID", message: "文件消息不适用于当前控制通道"))
             }
@@ -447,14 +488,15 @@ final class FileTransferEngine {
     }
     private func makeIncoming(peer: String, channel: UUID, id: String, attempt: String, name: String, size: Int64, hash: String, group: GroupMetadata?, clipboard: ClipboardBinding?, media:MediaBinding?, imagePreview: FileOfferImagePreview?) {
         guard sessions[peer]?.control == channel else { return }
-        guard active(peer: peer, excluding: id) == nil, preparing[peer] == nil else {
-            error(channel, "FILE_BUSY", "该设备已有进行中的文件任务", message: ["taskId": id, "attemptId": attempt]); return
-        }
-        if let old = tasks[id] { removeJob(old); storage.cleanPartial(old) }
         var task = FileTask(id: id, peerId: peer, direction: .incoming, name: name, size: size, sha256: hash,
                             sourcePath: "", destinationPath: "", state: .awaitingUser, progress: 0, attemptId: attempt, updatedAt: Date(), error: nil)
         task.group = group; task.clipboard = clipboard; task.media = media; task.imagePreview = imagePreview
         task.destinationPath = storage.final(task).path
+        guard (clipboard != nil || ordinaryTaskCount(peer: peer, excluding: id) < FILE_PENDING_LIMIT),
+              sessions[peer]?.limits.permits(task, among: Array(tasks.values)) == true else {
+            error(channel, "FILE_BUSY", "该设备的传输通道已满，请排队重试", message: task.wireFields); return
+        }
+        if let old = tasks[id] { removeJob(old); storage.cleanPartial(old) }
         do {
             try put(task); deadlines[id] = Date().addingTimeInterval(120)
             if let media { mediaRequests.removeValue(forKey:media.requestId);acceptOnQueue(id,expectedAttempt:task.attemptId) }
@@ -466,6 +508,14 @@ final class FileTransferEngine {
     }
     /// 用户操作绑定点击时的尝试；队列延迟或新offer替换后，旧页面不能操作新一代任务。
     func accept(_ id: String, expectedAttempt: String) { queue.async { self.acceptOnQueue(id, expectedAttempt: expectedAttempt) } }
+    func respondToOffer(_ id: String, expectedAttempt: String, peer: String, control: UUID, accept: Bool) {
+        queue.async {
+            guard let task = self.tasks[id], task.peerId == peer, task.attemptId == expectedAttempt,
+                  task.clipboard == nil, task.media == nil, self.sessions[peer]?.control == control else { return }
+            if accept { self.acceptOnQueue(id, expectedAttempt: expectedAttempt) }
+            else { self.rejectOnQueue(id, expectedAttempt: expectedAttempt) }
+        }
+    }
     private func acceptOnQueue(_ id: String, expectedAttempt: String) {
         guard var task = tasks[id], task.attemptId == expectedAttempt, task.direction == .incoming, task.state == .awaitingUser,
               let control = sessions[task.peerId]?.control else { return }
@@ -476,14 +526,15 @@ final class FileTransferEngine {
         } catch { fail(task, failure: .io) }
     }
     func reject(_ id: String, expectedAttempt: String) {
-        queue.async {
+        queue.async { self.rejectOnQueue(id, expectedAttempt: expectedAttempt) }
+    }
+    private func rejectOnQueue(_ id: String, expectedAttempt: String) {
             guard let task = self.tasks[id], task.attemptId == expectedAttempt, task.state == .awaitingUser else { return }
             do {
                 var rejected = task; rejected.state = .rejected; rejected.error = "已拒绝接收"; try self.put(rejected)
                 if let control = self.sessions[task.peerId]?.control { self.send(control, fileMessage("file.reject", task: task, extra: ["reason": "user"]), false) }
                 self.deadlines.removeValue(forKey: id); self.storage.cleanPartial(task)
             } catch { self.fail(task, failure: .io) }
-        }
     }
     func cancel(_ id: String, expectedAttempt: String) {
         queue.async {
@@ -503,13 +554,19 @@ final class FileTransferEngine {
             }
             guard task.direction == .outgoing,
                   [.failed, .rejected, .interrupted, .waitingConnection].contains(task.state),
-                  self.active(peer: task.peerId, excluding: id) == nil, self.preparing[task.peerId] == nil else { return }
+                  self.ordinaryTaskCount(peer: task.peerId, excluding: id) < FILE_PENDING_LIMIT else { return }
             guard self.sessions[task.peerId] != nil else { self.notice = "请先连接设备并协商文件能力"; self.emit(); return }
-            self.offer(id)
+            self.clearBusyRetry(id)
+            var queued = task; queued.state = .queued; queued.error = nil
+            do { try self.put(queued) } catch { self.fail(task, failure: .io) }
         }
     }
     private func offer(_ id: String) {
-        guard var task = tasks[id], let control = sessions[task.peerId]?.control else { return }
+        guard var task = tasks[id], task.state == .queued, let session = sessions[task.peerId],
+              session.limits.permits(task, among: Array(tasks.values)) else { return }
+        let control = session.control
+        // 旧对端仅一个共享槽，前台普通准备结束后再考虑后台剪贴板队列。
+        guard task.clipboard == nil || !session.limits.legacy || preparing[task.peerId] == nil else { return }
         do {
             _ = try openSourceForProbe(task)
             guard task.group == nil || sessions[task.peerId]?.groupCapable == true else { throw FileFailure(code: "FILE_UNSUPPORTED", message: "对端尚未协商文件组能力") }
@@ -702,7 +759,8 @@ final class FileTransferEngine {
                 self.sessions.removeValue(forKey: peer)
                 self.mediaRequests = self.mediaRequests.filter { $0.value.1 != control }
                 self.clipboardRequests = self.clipboardRequests.filter { $0.value.1 != control }
-                if revoked { if let id = self.preparing.removeValue(forKey: peer) { self.preparationTokens[id]?.cancel() } }
+                if revoked { self.cancelPeerPreparations(peer) }
+                else if let id = self.clipboardPreparing.removeValue(forKey: peer) { self.preparationTokens[id]?.cancel() }
                 for task in self.tasks.values where task.peerId == peer && !task.state.terminal && task.state != .committing {
                     self.removeJob(task)
                     if task.media != nil {self.terminate(task,state:.failed,text:"共享内容会话已失效，请重新下载")}
@@ -719,7 +777,7 @@ final class FileTransferEngine {
             self.mediaRequests = self.mediaRequests.filter { $0.value.0.peerId != peer }
             self.clipboardTrust.removeValue(forKey: peer)
             self.clipboardRequests = self.clipboardRequests.filter { $0.value.0.sourceDeviceId != peer }
-            if let id = self.preparing.removeValue(forKey: peer) { self.preparationTokens[id]?.cancel() }
+            self.cancelPeerPreparations(peer)
             if let session = self.sessions.removeValue(forKey: peer) {
                 for job in Array(self.jobs.values) where job.control == session.control { self.closeChannel(job.channel) }
             }
@@ -731,17 +789,22 @@ final class FileTransferEngine {
     }
     private func networkInterrupted(_ task: FileTask) {
         guard !task.state.terminal, task.state != .committing else { return }
+        clearBusyRetry(task.id)
         if task.direction == .incoming, task.clipboard?.privateOnly == true {
             terminate(task, state: .failed, text: "自动原图缓存已中断，可手动下载"); return
         }
         var interrupted = task; interrupted.state = task.direction == .outgoing ? .waitingConnection : .interrupted
         interrupted.progress = 0; interrupted.error = "连接中断，已保留任务"
         storage.cleanPartial(task); deadlines.removeValue(forKey: task.id)
-        do { try put(interrupted) } catch { notice = FileFailure.io.localizedDescription; emit() }
+        do {
+            try put(interrupted)
+            // 故障项等待控制重连或显式重试；已释放的槽位立即推进其它排队任务。
+            schedulePending(peer: task.peerId)
+        } catch { notice = FileFailure.io.localizedDescription; emit() }
     }
-    func tick() {
+    func tick(now: Date? = nil) {
         queue.async {
-            let now = Date()
+            let now = now ?? Date()
             for (id, retryAt) in self.commitRecoveryAt where retryAt <= now {
                 self.commitRecoveryAt.removeValue(forKey: id)
                 if let task = self.tasks[id], task.state == .committing { self.recover(task) }
@@ -756,6 +819,115 @@ final class FileTransferEngine {
                     if task.state == .committing { self.jobs.removeValue(forKey: job.channel); self.closeChannel(job.channel) }
                     else { self.fail(task, failure: FileFailure(code: "FILE_TIMEOUT", message: "文件数据或确认等待超时")) }
                 }
+            }
+        }
+    }
+    func setReceiveFolder(_ url: URL, completion: @escaping (String?) -> Void) {
+        queue.async {
+            do {
+                let folder = try ReceiveFolderLocation.selected(url)
+                if self.configuration.fileStoreDirectory == nil { try folder.persist() }
+                self.receiveFolder = folder; self.emit(); completion(nil)
+            } catch { completion("无法使用这个文件夹，请重新选择可写的接收文件夹") }
+        }
+    }
+    func retryReceivedSave(_ id: String, expectedAttempt: String) {
+        queue.async {
+            guard let task = self.tasks[id], task.attemptId == expectedAttempt, task.ordinaryIncoming,
+                  task.state == .completed, !self.hiddenHistory.contains(id),
+                  task.receivedSave == nil || task.receivedSave?.state == .failed,
+                  !self.singleExports.contains(id), !self.exportingIDs.contains(id), !self.queuedExportIDs.contains(id) else { return }
+            var updated = task; updated.receivedSave = ReceivedFileSaveReceipt(attempt: task.attemptId)
+            do { try self.put(updated) } catch { self.notice = "无法记录保存任务，请稍后重试"; self.emit() }
+        }
+    }
+    private func queueReceivedSave(_ task: FileTask) {
+        guard automaticSavingEnabled, task.ordinaryIncoming, task.state == .completed,
+              task.receivedSave?.state == .pending, !hiddenHistory.contains(task.id), !singleExports.contains(task.id) else { return }
+        singleExports.insert(task.id); receivedSaveQueue.append(task.id)
+        startNextReceivedSave()
+    }
+    private func startNextReceivedSave() {
+        guard !receivedSaveRunning, !receivedSaveQueue.isEmpty else { return }
+        let id = receivedSaveQueue.removeFirst()
+        guard var task = tasks[id], task.ordinaryIncoming, task.state == .completed,
+              var receipt = task.receivedSave, receipt.state == .pending, !hiddenHistory.contains(id) else {
+            singleExports.remove(id); startNextReceivedSave(); return
+        }
+        receivedSaveRunning = true
+        receipt.state = .saving; receipt.folder = receiveFolder; receipt.error = nil
+        task.receivedSave = receipt
+        do { try put(task) }
+        catch {
+            // 尚未开始复制，可安全显式重试；数据库暂不可写时先让界面脱离pending。
+            receipt.state = .failed; receipt.error = "无法记录保存状态，内部副本仍保留，请稍后重试"
+            task.receivedSave = receipt; tasks[id] = task
+            try? database.save(task)
+            singleExports.remove(id); receivedSaveRunning = false
+            emit(); startNextReceivedSave(); return
+        }
+        let captured = task, folder = receiveFolder
+        // 复用现有校验复制及IO队列，不占网络控制队列，也不借用剪贴板的下载意图。
+        io.async {
+            var resolved: ReceiveFolderLocation?
+            let result: BatchTaskOutcome
+            do {
+                guard let folder else { throw FileFailure.io }
+                let access = try ReceiveFolderAccess(folder, create: true)
+                resolved = access.location
+                result = withExtendedLifetime(access) {
+                    self.storage.exportReceivedTask(captured, applicationDirectory: access.url, cancellation: WorkCancellation())
+                }
+            } catch { result = BatchTaskOutcome(state: "failed", savedRoots: 0, message: "无法访问接收文件夹") }
+            self.queue.async {
+                defer { self.singleExports.remove(id); self.receivedSaveRunning = false; self.emit(); self.startNextReceivedSave() }
+                guard var current = self.tasks[id], current.attemptId == captured.attemptId,
+                      current.receivedSave?.state == .saving else { return }
+                var saved = receipt
+                saved.folder = resolved ?? folder
+                saved.roots = result.exportedRoots.map(\.lastPathComponent)
+                saved.state = result.state == "completed" ? .saved : .failed
+                saved.error = saved.state == .saved ? nil : result.savedRoots > 0 ? "部分文件已保存，请检查接收文件夹后重试" : "自动保存未完成，内部副本仍保留；请检查文件夹的权限和空间后重试"
+                current.receivedSave = saved
+                do {
+                    try self.put(current)
+                    if let resolved, self.receiveFolder == folder, resolved != folder {
+                        if self.configuration.fileStoreDirectory == nil { try resolved.persist() }
+                        self.receiveFolder = resolved
+                    }
+                } catch {
+                    saved.state = .failed; saved.error = "文件保存位置未能记录，请检查接收文件夹后重试"
+                    current.receivedSave = saved; self.tasks[id] = current
+                    self.notice = saved.error
+                }
+            }
+        }
+    }
+    /// 普通文件优先打开公共成品；旧历史仍可打开原内部成品，不重复导出。
+    func receivedLocations(_ id: String, expectedAttempt: String, completion: @escaping ([URL]?, String?) -> Void) {
+        queue.async {
+            guard let task = self.tasks[id], task.attemptId == expectedAttempt, task.ordinaryIncoming, task.state == .completed else {
+                completion(nil, "记录已更新，请重新打开"); return
+            }
+            guard let receipt = task.receivedSave else {
+                self.location(id: id, expectedAttempt: expectedAttempt) { completion($0.map { [$0] }, $0 == nil ? "本地文件已不存在" : nil) }; return
+            }
+            guard receipt.state == .saved, let folder = receipt.folder else {
+                completion(nil, receipt.error ?? "文件已收到，正在保存到接收文件夹"); return
+            }
+            self.io.async {
+                do {
+                    let access = try ReceiveFolderAccess(folder, create: false)
+                    let urls = receipt.roots.map { access.url.appendingPathComponent($0) }
+                    try withExtendedLifetime(access) {
+                        for url in urls {
+                            var info = stat()
+                            guard lstat(url.path, &info) == 0, [S_IFREG, S_IFDIR].contains(info.st_mode & S_IFMT) else { throw FileFailure.io }
+                        }
+                    }
+                    // 用户可编辑已保存文件，打开时只核对存在性，不以原哈希拒绝用户修改。
+                    completion(urls, nil)
+                } catch { completion(nil, "已保存的文件已移动或删除，可通过“另存为”重新保存") }
             }
         }
     }
@@ -980,8 +1152,49 @@ final class FileTransferEngine {
             }
         }
     }
-    private func active(peer: String, excluding: String? = nil) -> FileTask? {
-        tasks.values.first { $0.peerId == peer && $0.id != excluding && !$0.state.terminal }
+    private func clearBusyRetry(_ id: String) {
+        busyRetryWork.removeValue(forKey: id)?.cancel(); busyRetryCounts.removeValue(forKey: id)
+    }
+    /// BUSY是瞬态容量冲突，只为该尝试安排有界单次重试；终态、断线和手动重试撤销旧回调。
+    private func retryAfterBusy(_ task: FileTask, control: UUID) {
+        let count = busyRetryCounts[task.id] ?? 0
+        guard count < busyRetryDelays.count else {
+            terminate(task, state: .failed, text: "FILE_BUSY：对端持续繁忙，自动重试已停止，请稍后手动重试"); return
+        }
+        busyRetryCounts[task.id] = count + 1
+        deadlines.removeValue(forKey: task.id)
+        var queued = task; queued.state = .queued; queued.error = "对端繁忙，稍后自动重试（\(count + 1)/\(busyRetryDelays.count)）"
+        let work = DispatchWorkItem { [weak self] in
+            guard let self, let current = self.tasks[task.id], current.attemptId == task.attemptId,
+                  current.state == .queued, self.sessions[task.peerId]?.control == control else { return }
+            self.busyRetryWork.removeValue(forKey: task.id)
+            self.schedulePending(peer: task.peerId)
+        }
+        busyRetryWork[task.id]?.cancel(); busyRetryWork[task.id] = work
+        do { try put(queued); queue.asyncAfter(deadline: .now() + busyRetryDelays[count], execute: work) }
+        catch { clearBusyRetry(task.id); fail(task, failure: .io) }
+    }
+    private func ordinaryTaskCount(peer: String, excluding: String? = nil) -> Int {
+        tasks.values.filter { $0.peerId == peer && $0.id != excluding && $0.clipboard == nil && !$0.state.terminal }.count
+    }
+    private func cancelPeerPreparations(_ peer: String) {
+        for id in [preparing.removeValue(forKey: peer), clipboardPreparing.removeValue(forKey: peer)].compactMap({ $0 }) {
+            preparationTokens[id]?.cancel()
+        }
+    }
+    /// 事件推进并合并同一轮通知。先普通任务后剪贴板，旧对端仍共享唯一槽位；不做网络轮询重试。
+    private func schedulePending(peer: String) {
+        guard pendingScheduling.insert(peer).inserted else { return }
+        queue.async {
+            self.pendingScheduling.remove(peer)
+            guard self.sessions[peer] != nil else { return }
+            let queued = self.tasks.values.filter { $0.peerId == peer && $0.direction == .outgoing && $0.state == .queued && self.busyRetryWork[$0.id] == nil }.sorted {
+                if ($0.clipboard == nil) != ($1.clipboard == nil) { return $0.clipboard == nil }
+                if $0.updatedAt != $1.updatedAt { return $0.updatedAt < $1.updatedAt }
+                return $0.id < $1.id
+            }
+            for task in queued { self.offer(task.id) }
+        }
     }
     private func progress(_ task: FileTask) throws {
         tasks[task.id] = task
@@ -991,6 +1204,12 @@ final class FileTransferEngine {
     }
     private func put(_ task: FileTask, emit shouldEmit: Bool = true) throws {
         var stored = task; stored.updatedAt = Date()
+        if stored.receivedSave?.attempt != stored.attemptId { stored.receivedSave = nil }
+        // 和完成收据同一行落库；旧的已完成历史没有此标记，不批量搬迁。
+        if automaticSavingEnabled, stored.ordinaryIncoming, stored.state == .completed,
+           tasks[stored.id]?.state != .completed, stored.receivedSave == nil {
+            stored.receivedSave = ReceivedFileSaveReceipt(attempt: stored.attemptId)
+        }
         // 已清理历史若收到新的活动尝试，应重新显示待接收/进度；完成去重收据仍保持隐藏。
         let showHistory = hiddenHistory.contains(stored.id) && !stored.state.terminal
         let restoringPrivateImage = stored.state == .completed && clearedPrivateImages.contains(stored.id)
@@ -999,6 +1218,7 @@ final class FileTransferEngine {
         if restoringPrivateImage { clearedPrivateImages.remove(stored.id) }
         if showHistory { hiddenHistory.remove(stored.id) }
         tasks[task.id] = stored
+        if stored.state.terminal { clearBusyRetry(stored.id) }
         if stored.state != .committing { commitRecoveryAttempts.removeValue(forKey: task.id); commitRecoveryAt.removeValue(forKey: task.id) }
         if stored.direction == .incoming, stored.clipboard?.privateOnly == true, stored.state == .completed {
             privateCacheSizes[stored.id] = stored.size
@@ -1011,6 +1231,8 @@ final class FileTransferEngine {
             io.async { self.storage.cleanSource(stored) }
         }
         savedProgress[task.id] = (stored.progress, Date())
+        if stored.receivedSave?.state == .pending { queueReceivedSave(stored) }
+        if stored.state.terminal || stored.state == .queued { schedulePending(peer: stored.peerId) }
         if shouldEmit { emit() }
     }
     private func removeJob(_ task: FileTask) {
@@ -1054,7 +1276,14 @@ final class FileTransferEngine {
     }
     private func emit() {
         var snapshot = FileTransferSnapshot()
-        snapshot.tasks = tasks.values.sorted { $0.updatedAt > $1.updatedAt }.map { task in var view = task.view; view.historyHidden = hiddenHistory.contains(task.id); view.privateCacheBytes = privateCacheSizes[task.id] ?? 0; view.privateOriginalCleared = clearedPrivateImages.contains(task.id); view.managementBusy = singleExports.contains(task.id) || exportingIDs.contains(task.id) || queuedExportIDs.contains(task.id) || checking.contains(task.id); return view }
+        snapshot.receiveFolderPath = receiveFolder?.path
+        var pending: [FileTaskView] = []
+        snapshot.tasks = tasks.values.sorted { $0.updatedAt > $1.updatedAt }.map { task in
+            var view = task.view; view.historyHidden = hiddenHistory.contains(task.id); view.privateCacheBytes = privateCacheSizes[task.id] ?? 0; view.privateOriginalCleared = clearedPrivateImages.contains(task.id); view.managementBusy = singleExports.contains(task.id) || exportingIDs.contains(task.id) || queuedExportIDs.contains(task.id) || checking.contains(task.id)
+            if view.isFileTransferRecord, task.media == nil, task.direction == .incoming, task.state == .awaitingUser { pending.append(view) }
+            return view
+        }
+        snapshot.pendingReceives = pending
         snapshot.preparingPeerIds = Array(preparing.keys).sorted(); snapshot.error = notice; snapshot.noticeRevision = noticeRevision
         snapshot.preparations = preparing.map { FilePreparationView(id: $0.value, peerId: $0.key) }
         snapshot.batchExport = exportView
